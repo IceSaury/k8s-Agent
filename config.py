@@ -77,6 +77,9 @@ class Settings:
     search_timeout: int = 10
     tavily_api_key: str = ""
 
+    # --- 对话记忆 ---
+    memory_window_rounds: int = 10
+
     # --- 飞书机器人 ---
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
@@ -138,6 +141,7 @@ def load_settings() -> Settings:
         search_proxy=_get("SEARCH_PROXY"),
         search_timeout=_get_int("SEARCH_TIMEOUT", 10),
         tavily_api_key=tavily_api_key,
+        memory_window_rounds=_get_int("MEMORY_WINDOW_ROUNDS", 10),
         feishu_app_id=feishu_app_id,
         feishu_app_secret=_get("FEISHU_APP_SECRET"),
         feishu_connection_mode=_get("FEISHU_CONNECTION_MODE", "ws").lower(),
@@ -175,6 +179,7 @@ if __name__ == "__main__":
         ("K8S_MCP_TIMEOUT", str(settings.mcp_timeout)),
         ("ALLOW_MCP_FALLBACK", str(settings.allow_mcp_fallback)),
         ("TOOL_CALL_TIMEOUT", str(settings.tool_call_timeout)),
+        ("MEMORY_WINDOW_ROUNDS", str(settings.memory_window_rounds)),
         ("SEARCH_PROVIDER", settings.search_provider),
         ("SEARCH_MAX_RESULTS", str(settings.search_max_results)),
         ("SEARCH_PROXY", settings.search_proxy or "(未配置)"),

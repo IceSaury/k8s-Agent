@@ -27,15 +27,17 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessageChunk, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph.message import RemoveMessage
 
 from config import settings
 from prompts import SYSTEM_PROMPT
@@ -198,6 +200,88 @@ async def load_all_tools() -> tuple[list[BaseTool], str]:
     return [*k8s_tools, *search_tools], source
 
 
+# ---------------------------------------------------------------------------
+# 记忆治理：轮数窗口 + 旧工具结果清理
+#
+# 背景：checkpointer 会把每轮的 ToolMessage 原文永久存档。resource list 拉一次全量
+# pods 就是 143KB YAML，之后每轮、每次模型调用都要把这段旧 YAML 重新预填一遍，
+# 第二轮开始就明显变慢（实测 12.9s -> 37s+）。这里两道闸门：
+#   1. 轮数窗口：历史超过 MEMORY_WINDOW_ROUNDS 轮时，把最老的整轮从存档里删掉；
+#   2. 体积清理：发给模型时，把"已结束旧轮"的工具结果换成占位符（不改存档）。
+# 上一轮的结论仍留在该轮最终回答（AIMessage）里，模型照常可以引用。
+# ---------------------------------------------------------------------------
+
+# 被清理的工具结果的占位符。要明确告诉模型"内容没了、需要就重查"，
+# 避免它把占位符当成真实查询结果继续推理
+_CLEARED_TOOL_PLACEHOLDER = (
+    "[该工具结果属于较早的对话轮次，为控制上下文体积已清理。"
+    "如仍需这些细节，请重新调用对应工具，不要凭记忆猜测。]"
+)
+
+
+def _round_starts(messages: Sequence[BaseMessage]) -> list[int]:
+    """返回每轮对话的起始下标（即每条 HumanMessage 的位置）。"""
+    return [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
+
+
+def _window_removals(messages: Sequence[BaseMessage], window: int) -> list[RemoveMessage]:
+    """超过 window 轮时，把最老的若干轮整轮删除（含其中的工具调用与结果）。
+
+    删除永远对齐轮次边界，不会只删 AIMessage 而留下它对应的 ToolMessage（反之亦然），
+    避免模型看到"有工具结果却没有工具调用"的残缺历史。
+    """
+    starts = _round_starts(messages)
+    if len(starts) <= window:
+        return []
+    keep_from = starts[-window]
+    return [RemoveMessage(id=m.id) for m in messages[:keep_from] if getattr(m, "id", None)]
+
+
+def _clear_old_tool_results(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
+    """把"已结束旧轮"的工具结果换成占位符，当前轮的原样保留。
+
+    只改本次发给模型的副本（返回新列表），不动 state 与存档。当前轮以最后一条
+    HumanMessage 为起点：它之前的 ToolMessage 都属于已结束的轮次。
+    """
+    starts = _round_starts(messages)
+    if not starts:
+        return list(messages)
+    current_start = starts[-1]
+
+    edited: list[BaseMessage] = []
+    for idx, message in enumerate(messages):
+        if (
+            idx < current_start
+            and isinstance(message, ToolMessage)
+            and message.content != _CLEARED_TOOL_PLACEHOLDER
+        ):
+            message = message.model_copy(update={"content": _CLEARED_TOOL_PLACEHOLDER})
+        edited.append(message)
+    return edited
+
+
+class MemoryWindowMiddleware(AgentMiddleware):
+    """记忆治理中间件，两个钩子各管一件事。
+
+    - before_model：轮数窗口。返回 RemoveMessage 列表，LangGraph 的消息 reducer 会
+      把它们从 state（也就是存档）里真正删掉，历史因此不会无限增长。
+    - wrap_model_call：体积清理。在请求副本上替换旧工具结果，只影响这一次模型调用。
+    """
+
+    def before_model(self, state, runtime):  # noqa: ARG002 - 中间件签名固定
+        removals = _window_removals(state["messages"], settings.memory_window_rounds)
+        return {"messages": removals} if removals else None
+
+    async def abefore_model(self, state, runtime):  # noqa: ARG002
+        return self.before_model(state, runtime)
+
+    def wrap_model_call(self, request, handler):
+        return handler(request.override(messages=_clear_old_tool_results(request.messages)))
+
+    async def awrap_model_call(self, request, handler):
+        return await handler(request.override(messages=_clear_old_tool_results(request.messages)))
+
+
 def build_llm() -> BaseChatModel:
     """按配置初始化 LLM（qwen-plus 走 DashScope 的 OpenAI 兼容接口）。"""
     from langchain.chat_models import init_chat_model
@@ -225,6 +309,7 @@ def build_agent(
         tools=tools if tools is not None else [],
         system_prompt=SYSTEM_PROMPT,
         checkpointer=checkpointer or InMemorySaver(),
+        middleware=[MemoryWindowMiddleware()],
     )
 
 

@@ -211,6 +211,27 @@ LangGraph 的 `ToolNode` 会把错误文本当作**工具结果**回给 LLM，�
 | 实际入参 | `namespace: "all"` | `namespace: ""` |
 | 结论 | pods 为空（错） | 3 节点 / 23 个 pods（对） |
 
+## 对话记忆治理（轮数窗口 + 旧工具结果清理）
+
+checkpointer 会把每轮 **ToolMessage 的原文**一起存档。`resource list` 拉一次全量 pods 就是
+143KB YAML，从第二轮起每次模型调用都要把这段旧 YAML 重新预填一遍：同一句小问题实测
+**空历史 12.9s、带历史 37.1s**（群里那轮更慢到 105.8s，因为它工具调用更多、回答更长，
+而一轮里有几次工具调用就要做几次模型 pass，每 pass 都重读一遍历史）。
+
+`agent.py` 的 `MemoryWindowMiddleware` 两道闸门：
+
+| 钩子 | 作用 | 是否写存档 |
+|---|---|---|
+| `before_model` | 轮数窗口：历史超过 `MEMORY_WINDOW_ROUNDS` 轮（默认 10）时，用 `RemoveMessage` 整轮删除最老的轮次 | 是（历史不再无限增长） |
+| `wrap_model_call` | 体积清理：把「已结束旧轮」的 ToolMessage 原文换成占位符，当前轮原样保留 | 否（只影响本次调用） |
+
+两个设计细节：
+
+- 删除永远对齐轮次边界（以 HumanMessage 为起点），不会只删 AIMessage 而留下它对应的
+  ToolMessage，模型不会看到「有工具结果却没有工具调用」的残缺历史。
+- 被清理的只是「原始证据」，上一轮的**结论**仍留在该轮最终回答（AIMessage）里，模型照常
+  可以引用；真需要细节时占位符会提醒它重新调工具，而不是凭记忆猜。
+
 ## 与需求文档的差异（实现时的依据）
 
 1. **MCP 传输方式**：PDF §2.3 称使用 `streamable_http`，但 `mcp-k8s-eye` 实际以 **SSE** 提供服务（endpoint 以 `/sse` 结尾）。已按 SSE 实现，并把传输方式做成 `K8S_MCP_TRANSPORT` 配置项，切换时不改代码。
@@ -274,3 +295,8 @@ LangGraph 的 `ToolNode` 会把错误文本当作**工具结果**回给 LLM，�
 - **`node analyze` 恒返回空**：PDF §1.4 的工具清单里它排在最前，直觉上该用它列节点，
   实测本机 Server 上 `node analyze`/`pod analyze` 返回 `[]`、`deployment analyze`/`service analyze`
   返回 `null`。别在它身上浪费时间，列资源统一用 `resource list`。
+- **多轮变慢的真凶是历史里的工具原文**：第一轮不慢、第二轮突然慢一倍以上时，别先怀疑模型
+  或服务端——先看历史里躺了多大的 ToolMessage。 LangChain 自带的 `ClearToolUsesEdit`
+  本来是对症的工具，但它的 `keep` 语义是「保留最近 N 条工具结果」：第二轮时第一轮那份
+  143KB 恰好是「最近的一条」，于是原封不动留下，等于没清。所以最终自己写了轮次感知的
+  `MemoryWindowMiddleware`：旧轮全清、当前轮保留，正好绕开这个语义错位。
