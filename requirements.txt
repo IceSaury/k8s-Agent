@@ -1,0 +1,34 @@
+# Install: source .venv/Scripts/activate && pip install -r requirements.txt
+# NOTE: keep this file ASCII-only. pip on Chinese Windows decodes it with the
+#       system locale (cp936/GBK), so Chinese comments raise UnicodeDecodeError.
+#       Chinese explanations live in README.md instead.
+
+# Agent framework - exact versions from the spec PDF (section 2.1)
+langchain==1.2.10
+langgraph==1.0.9
+langchain-mcp-adapters==0.2.1
+
+# MCP SDK upper bound is required: the adapters declare only "mcp>=1.9.2", so pip
+# resolves mcp 2.x, which dropped mcp.shared.context.RequestContext and breaks
+# "from langchain_mcp_adapters.client import MultiServerMCPClient".
+mcp<2
+
+# langgraph-prebuilt must be pinned low: langchain 1.2.10 caps langgraph<1.1.0,
+# but prebuilt 1.0.9+ calls langgraph.runtime.ExecutionInfo (added in langgraph
+# 1.1), so pip's default of 1.0.13 breaks "from langchain.agents import create_agent".
+langgraph-prebuilt==1.0.8
+
+# LLM provider - qwen-plus via DashScope OpenAI-compatible endpoint
+langchain-openai
+
+# Search tool - free DuckDuckGo path; uncomment langchain-tavily for Tavily
+langchain-community
+duckduckgo-search
+# langchain-tavily
+
+# CLI rendering and config loading
+rich
+python-dotenv
+
+# Feishu bot (stage 6). Feishu official SDK
+lark-oapi

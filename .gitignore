@@ -1,0 +1,25 @@
+# Python 字节码与打包产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境（由 requirements.txt 重建，不入库）
+.venv/
+venv/
+
+# 密钥：.env 只保留在本机，仓库里只提交 .env.example
+.env
+.env.local
+
+# 测试与工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 编辑器与系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
