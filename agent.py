@@ -1,7 +1,13 @@
 """
-Agent 核心模块：接载 MCP 工具、组装 Agent。
+Agent 核心模块：接载 MCP 工具、组装 Agent、提供带记忆的流式对话。
 
 对应 PDF §3.2 中 agent.py 的职责：初始化 MCP 客户端、加载工具、创建 Agent。
+
+对外主入口是 K8sAgent（CLI 与飞书机器人共用）：
+    bot = await K8sAgent.create()
+    async for event in bot.astream("查看集群有哪些 node 节点"):
+        ...
+记忆由 LangGraph 的 checkpointer 承担，同一 thread_id 的多轮对话自动带上下文。
 
 工具来源有两处：
   1. K8s 工具 —— 由虚拟机上部署的 mcp-k8s-eye（MCP Server）动态提供，共 19 个；
@@ -21,10 +27,15 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from typing import Literal
 
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessageChunk
 from langchain_core.tools import BaseTool
+from langgraph.checkpoint.memory import InMemorySaver
 
 from config import settings
 from prompts import SYSTEM_PROMPT
@@ -33,6 +44,9 @@ from tools.search import load_search_tools
 
 # MCP Server 在客户端里的标识名，与用户提供的 mcpServers 配置保持一致
 MCP_SERVER_NAME = "k8s-eye"
+
+# 默认会话 ID。多轮对话靠它区分上下文：同一个 thread_id 才能记住历史
+DEFAULT_THREAD_ID = "cli"
 
 
 def _sanitize_tool_name(raw_name: str) -> str:
@@ -131,29 +145,172 @@ def build_llm() -> BaseChatModel:
     )
 
 
-def build_agent(model: BaseChatModel | None = None, tools: list[BaseTool] | None = None):
-    """组装 ReAct Agent：LangChain 的 create_agent 底层就是 LangGraph。"""
+def build_agent(
+    model: BaseChatModel | None = None,
+    tools: list[BaseTool] | None = None,
+    checkpointer: InMemorySaver | None = None,
+):
+    """组装 ReAct Agent：LangChain 的 create_agent 底层就是 LangGraph。
+
+    传入 checkpointer 后 Agent 就带记忆能力：同一 thread_id 的多轮对话会自动
+    带上历史消息，无需手动拼接 messages。
+    """
     return create_agent(
         model=model or build_llm(),
         tools=tools if tools is not None else [],
         system_prompt=SYSTEM_PROMPT,
+        checkpointer=checkpointer or InMemorySaver(),
     )
 
 
+# ---------------------------------------------------------------------------
+# 流式事件：把 LangGraph 的原始流翻译成入口层（CLI / 飞书）好渲染的事件
+# ---------------------------------------------------------------------------
+
+EventKind = Literal["token", "tool_start", "tool_end", "done"]
+
+
+@dataclass
+class AgentEvent:
+    """一次流式输出中的单个事件。"""
+
+    kind: EventKind
+    text: str = ""                      # token 事件：本次增量文本
+    tool_name: str = ""                 # 工具事件：展示用工具名（含空格的原名）
+    tool_args: dict = field(default_factory=dict)
+    ok: bool = True                     # tool_end 事件：工具是否正常返回
+
+
+def _content_to_text(content: object) -> str:
+    """把消息内容统一成文本。内容可能是 str，也可能是文本块列表。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "".join(parts)
+    return ""
+
+
+class K8sAgent:
+    """
+    Agent 运行时封装。
+
+    CLI 与飞书入口都通过它对话，好处是两处共用同一份工具、记忆与会话历史逻辑。
+    生命周期：先 await K8sAgent.create() 初始化（会连 MCP Server），再反复
+    await astream(...) 多轮对话。
+    """
+
+    def __init__(self, graph, tools: list[BaseTool], k8s_source: str, checkpointer: InMemorySaver):
+        self.graph = graph
+        self.tools = tools
+        self.k8s_source = k8s_source
+        self._checkpointer = checkpointer
+        # 净化名 -> 原始展示名，CLI 展示工具调用时用原名（如 resource_list -> resource list）
+        self.display_names = {
+            t.name: (t.metadata or {}).get("mcp_name", t.name) for t in tools
+        }
+
+    @classmethod
+    async def create(cls, model: BaseChatModel | None = None) -> K8sAgent:
+        """初始化 Agent：加载工具 -> 建 LLM -> 组装带记忆的 Agent。"""
+        tools, k8s_source = await load_all_tools()
+        checkpointer = InMemorySaver()
+        graph = build_agent(model=model, tools=tools, checkpointer=checkpointer)
+        return cls(graph=graph, tools=tools, k8s_source=k8s_source, checkpointer=checkpointer)
+
+    def tool_names(self) -> list[str]:
+        """按原始名返回工具清单，供 CLI 的 tools 命令展示。"""
+        k8s = [self.display_names[t.name] for t in self.tools if t.name != "web_search"]
+        names = sorted(k8s)
+        if any(t.name == "web_search" for t in self.tools):
+            names.append("web_search")
+        return names
+
+    def reset_memory(self, thread_id: str = DEFAULT_THREAD_ID) -> None:
+        """清空某个会话的历史（CLI 的 clear 命令）。"""
+        self._checkpointer.delete_thread(thread_id)
+
+    async def astream(
+        self,
+        user_input: str,
+        thread_id: str = DEFAULT_THREAD_ID,
+    ) -> AsyncIterator[AgentEvent]:
+        """
+        流式执行一轮对话，逐个吐出事件。
+
+        同时订阅两种流：
+          - messages：逐 token 的增量文本，用于实时打印回答；
+          - updates：节点级结果，用于捕获完整的工具调用（名称、参数）与工具返回。
+        """
+        config = {"configurable": {"thread_id": thread_id}}
+
+        async for mode, chunk in self.graph.astream(
+            {"messages": [{"role": "user", "content": user_input}]},
+            config=config,
+            stream_mode=["messages", "updates"],
+        ):
+            if mode == "messages":
+                message, meta = chunk
+                if meta.get("langgraph_node") != "model" or not isinstance(message, AIMessageChunk):
+                    continue
+                text = _content_to_text(message.content)
+                if text:
+                    yield AgentEvent(kind="token", text=text)
+                continue
+
+            # mode == "updates"：chunk 形如 {"model": {"messages": [...]}}
+            for node, update in (chunk or {}).items():
+                messages = (update or {}).get("messages") if isinstance(update, dict) else None
+                if not messages:
+                    continue
+
+                if node == "model":
+                    for message in messages:
+                        for call in getattr(message, "tool_calls", None) or []:
+                            raw_name = call.get("name", "")
+                            yield AgentEvent(
+                                kind="tool_start",
+                                tool_name=self.display_names.get(raw_name, raw_name),
+                                tool_args=call.get("args") or {},
+                            )
+                elif node == "tools":
+                    for message in messages:
+                        raw_name = getattr(message, "name", "") or ""
+                        status = getattr(message, "status", "success")
+                        yield AgentEvent(
+                            kind="tool_end",
+                            tool_name=self.display_names.get(raw_name, raw_name),
+                            ok=status != "error",
+                        )
+
+        yield AgentEvent(kind="done")
+
+
 if __name__ == "__main__":
-    # 自测：python -m agent —— 只验证工具接载，不调用 LLM（阶段4 再加 Agent 对话）
+    # 自测：python -m agent —— 跑两轮真实对话，验证工具调用、流式输出与多轮记忆
     from rich.console import Console
 
     console = Console()
 
     async def _main() -> None:
-        tools, source = await load_all_tools()
-        k8s_names = [t.name for t in tools if t.name != "web_search"]
+        console.print("[bold]正在初始化 Agent...[/bold]")
+        bot = await K8sAgent.create()
+        console.print(f"[bold]K8s 工具来源:[/bold] {bot.k8s_source} | "
+                      f"[bold]工具总数:[/bold] {len(bot.tools)}")
 
-        console.print(f"[bold]K8s 工具来源:[/bold] {source}")
-        console.print(f"[bold]K8s 工具数:[/bold] {len(k8s_names)}")
-        console.print(f"[bold]K8s 工具:[/bold] {sorted(k8s_names)}")
-        console.print(f"[bold]搜索工具:[/bold] {[t.name for t in tools if t.name == 'web_search']}")
-        console.print(f"[bold]合计:[/bold] {len(tools)} 个工具")
+        for question in ("查看集群有哪些 node 节点", "刚才那个集群只有几个节点？"):
+            console.print(f"\n[bold cyan]You:[/bold cyan] {question}")
+            buffer = ""
+            async for event in bot.astream(question):
+                if event.kind == "token":
+                    buffer += event.text
+                elif event.kind == "tool_start":
+                    console.print(f"  [yellow]调用工具:[/yellow] {event.tool_name} {event.tool_args}")
+                elif event.kind == "tool_end":
+                    console.print(f"  [green]工具返回完成:[/green] {event.tool_name}")
+            console.print(f"[bold]Agent:[/bold] {buffer[:300]}{'...' if len(buffer) > 300 else ''}")
 
     asyncio.run(_main())
