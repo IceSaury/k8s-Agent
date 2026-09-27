@@ -20,6 +20,9 @@ cp .env.example .env    # 然后填写真实值
 python cli.py
 ```
 
+配置要点：LLM 用 `qwen-plus`（走 DashScope 兼容接口），搜索用 `tavily`（需 `TAVILY_API_KEY`，
+本机网络下 DuckDuckGo 不可达，见下方踩坑记录）。
+
 ## 架构
 
 四层，自上而下（对应 PDF §3.1）：
@@ -80,5 +83,11 @@ Agent 核心层         agent.py
 - **`requirements.txt` 中文注释导致 pip 失败**：中文 Windows 下 pip 用系统编码（cp936/GBK）读取该文件，含中文注释会抛 `UnicodeDecodeError`。已约定此文件只用 ASCII 注释，中文说明放本文档。Python 源文件不受影响（默认 UTF-8）。
 - **`mcp` 必须锁 1.x**：`langchain-mcp-adapters 0.2.1` 只声明 `mcp>=1.9.2` 没有上界，pip 会装 `mcp 2.x`，而 2.x 删掉了 `mcp.shared.context.RequestContext`，导致 `from langchain_mcp_adapters.client import MultiServerMCPClient` 直接 ImportError。已在 requirements 中加 `mcp<2`。
 - **`langgraph-prebuilt` 必须锁 1.0.8**：`langchain 1.2.10` 限制 `langgraph<1.1.0`，而 `langgraph-prebuilt` 从 1.0.9 起调用 `langgraph.runtime.ExecutionInfo`（langgraph 1.1 才引入），两者范围重叠但 API 不兼容，pip 默认装 1.0.13 会让 `from langchain.agents import create_agent` 报错。已锁 1.0.8。
+- **DuckDuckGo 在本机网络完全不可达**：实测其后端 `search.yahoo.com` 连接被拒绝（`os error 10061`），
+  而 `api.tavily.com` 返回 200。因此 `SEARCH_PROVIDER` 默认改为 **tavily**，需要去 tavily.com 申请
+  API Key（有免费额度）。`duckduckgo` 分支代码保留且可正常构造工具，换到可访问的网络环境即可用。
+- **`duckduckgo-search` 包名已失效**：`langchain-community 0.4.2` 的 DuckDuckGo 封装改成了
+  `import ddgs`，装旧的 `duckduckgo-search` 会抛 `Could not import ddgs python package`。
+  依赖里已换成 `ddgs`。
 - **PDF 自身的版本矛盾**：§2.1 技术栈表写 `langgraph 1.1.x`，§4.2 具体版本写 `1.0.9`。经实测，`langchain 1.2.10` 的上界是 `<1.1.0`，因此以 **1.0.9** 为准，§2.1 表格的写法有误。
 - **`DASHSCOPE_API_KEY` 回退**：`.env` 里 `OPENAI_API_KEY` 为占位符时，`config.py` 自动回退读系统环境变量 `DASHSCOPE_API_KEY`，避免在文件里落盘明文密钥。

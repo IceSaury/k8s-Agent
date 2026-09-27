@@ -70,7 +70,7 @@ class Settings:
     allow_mcp_fallback: bool = True
 
     # --- 搜索工具 ---
-    search_provider: str = "duckduckgo"
+    search_provider: str = "tavily"
     search_max_results: int = 5
     tavily_api_key: str = ""
 
@@ -115,6 +115,11 @@ def load_settings() -> Settings:
     if _is_placeholder(feishu_app_id):
         warnings.append("飞书凭证未配置（FEISHU_APP_ID / FEISHU_APP_SECRET 仍是占位符），飞书入口暂不可用")
 
+    search_provider = _get("SEARCH_PROVIDER", "tavily").lower()
+    tavily_api_key = _get("TAVILY_API_KEY")
+    if search_provider == "tavily" and _is_placeholder(tavily_api_key):
+        warnings.append("SEARCH_PROVIDER=tavily 但 TAVILY_API_KEY 未填，web_search 工具将不可用（去 tavily.com 取 Key）")
+
     return Settings(
         llm_provider=_get("LLM_PROVIDER", "openai"),
         llm_model=_get("LLM_MODEL", "qwen-plus"),
@@ -124,9 +129,9 @@ def load_settings() -> Settings:
         mcp_transport=mcp_transport,
         mcp_timeout=_get_int("K8S_MCP_TIMEOUT", 10),
         allow_mcp_fallback=_get_bool("ALLOW_MCP_FALLBACK", True),
-        search_provider=_get("SEARCH_PROVIDER", "duckduckgo").lower(),
+        search_provider=search_provider,
         search_max_results=_get_int("SEARCH_MAX_RESULTS", 5),
-        tavily_api_key=_get("TAVILY_API_KEY"),
+        tavily_api_key=tavily_api_key,
         feishu_app_id=feishu_app_id,
         feishu_app_secret=_get("FEISHU_APP_SECRET"),
         feishu_connection_mode=_get("FEISHU_CONNECTION_MODE", "ws").lower(),
@@ -149,6 +154,11 @@ if __name__ == "__main__":
     table.add_column("值")
 
     masked_key = f"{settings.api_key[:6]}...{settings.api_key[-4:]}" if len(settings.api_key) > 10 else "(未配置)"
+    masked_tavily = (
+        f"{settings.tavily_api_key[:8]}...{settings.tavily_api_key[-4:]}"
+        if len(settings.tavily_api_key) > 12
+        else "(未配置)"
+    )
     for name, value in [
         ("LLM_PROVIDER", settings.llm_provider),
         ("LLM_MODEL", settings.llm_model),
@@ -160,6 +170,7 @@ if __name__ == "__main__":
         ("ALLOW_MCP_FALLBACK", str(settings.allow_mcp_fallback)),
         ("SEARCH_PROVIDER", settings.search_provider),
         ("SEARCH_MAX_RESULTS", str(settings.search_max_results)),
+        ("TAVILY_API_KEY", masked_tavily),
         ("FEISHU_APP_ID", settings.feishu_app_id),
         ("FEISHU_CONNECTION_MODE", settings.feishu_connection_mode),
     ]:

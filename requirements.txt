@@ -21,10 +21,16 @@ langgraph-prebuilt==1.0.8
 # LLM provider - qwen-plus via DashScope OpenAI-compatible endpoint
 langchain-openai
 
-# Search tool - free DuckDuckGo path; uncomment langchain-tavily for Tavily
+# Search tools.
+# tavily is the working provider on this network - DuckDuckGo is unreachable
+# from here (its backends resolve through search.yahoo.com, which is blocked),
+# so tavily is the default in .env.example. It needs TAVILY_API_KEY.
+# ddgs is kept because SEARCH_PROVIDER=duckduckgo is still a supported switch;
+# note the old package name "duckduckgo-search" no longer works with
+# langchain-community 0.4.2, which imports "ddgs" instead.
 langchain-community
-duckduckgo-search
-# langchain-tavily
+langchain-tavily
+ddgs
 
 # CLI rendering and config loading
 rich
