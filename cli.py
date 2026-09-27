@@ -15,53 +15,19 @@ CLI 交互入口（对应 PDF §4.2 cli.py：交互循环、流式输出、对�
     clear             清空当前会话历史（只清对话，不重载工具）
     tools             列出全部可用工具
 
-入口启动时做一次控制台 UTF-8 引导，原因见 _bootstrap_console 的说明。
+入口启动时做一次控制台 UTF-8 引导，原因见 console_boot.py。
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import sys
 import time
 
-
-def _bootstrap_console() -> None:
-    """
-    Windows 控制台引导：切成 UTF-8 并打开 ANSI 转义。
-
-    两个坑叠在一起：
-      1. 中文 Windows 控制台代码页是 GBK，输出 ✅ / 🔧 / 🤖 这类字符会
-         UnicodeEncodeError 或显示乱码。SetConsoleOutputCP(65001) 让控制台按
-         UTF-8 解释字节，再把 Python 的 stdout/stderr 也改成 UTF-8 才配套。
-      2. 代码页改 65001 后，键盘输入的字节也是 UTF-8，stdin 同样要改，
-         否则中文提问会被按 GBK 解码成乱码。
-    另外打开 ENABLE_VIRTUAL_TERMINAL_PROCESSING，rich 的配色才能生效。
-    非 Windows 平台直接返回（本来就是 UTF-8 终端）。
-    """
-    if sys.platform != "win32":
-        return
-
-    try:
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32
-        kernel32.SetConsoleOutputCP(65001)
-        kernel32.SetConsoleCP(65001)
-        # 7 = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-    except Exception:  # noqa: BLE001 - 可能是重定向输出/无控制台，尽力而为即可
-        pass
-
-    for stream in (sys.stdout, sys.stderr, sys.stdin):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:  # noqa: BLE001 - 某些流不支持 reconfigure
-            pass
-
+from console_boot import bootstrap_console
 
 # 必须在导入 rich 之前执行：Console 构造时会探测终端编码，晚了就不生效
-_bootstrap_console()
+bootstrap_console()
 
 from rich.console import Console  # noqa: E402
 from rich.live import Live  # noqa: E402

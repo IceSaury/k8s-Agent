@@ -18,6 +18,9 @@ cp .env.example .env    # 然后填写真实值
 
 # 4. 启动 CLI
 python cli.py
+
+# 或启动飞书机器人（需先配好 FEISHU_APP_ID / FEISHU_APP_SECRET，见下方「飞书入口」）
+python -m feishu.feishu_bot
 ```
 
 配置要点：LLM 用 `qwen-plus`（走 DashScope 兼容接口）；搜索用 `duckduckgo`（免费无需 Key），
@@ -44,6 +47,7 @@ Agent 核心层         agent.py
 | 模块 | 职责 |
 |---|---|
 | `config.py` | 读取 `.env`，集中管理 LLM / MCP Server / 搜索 / 飞书 配置。所有魔法值只在这里出现一次 |
+| `console_boot.py` | 控制台 UTF-8 引导，两个入口共用，必须在导入 rich 之前调用 |
 | `prompts.py` | K8s SRE 专家系统提示词 |
 | `tools/search.py` | 搜索工具封装，`duckduckgo` 与 `tavily` 可切换 |
 | `agent.py` | 初始化 MCP 客户端、发现并加载工具、创建 Agent、管理对话记忆、流式输出 |
@@ -62,7 +66,7 @@ Agent 核心层         agent.py
 | 3 | MCP 客户端接载与工具发现（含 mock 回退） | ✅ |
 | 4 | `agent.py` Agent 组装 + 记忆 + 流式 | ✅ |
 | 5 | `cli.py` 终端界面 | ✅ |
-| 6 | `feishu/feishu_bot.py` 飞书入口 | 待开始 |
+| 6 | `feishu/feishu_bot.py` 飞书入口 | ✅ |
 | 7 | 虚拟机开机后真机联调 | 待开始 |
 
 ## CLI 使用
@@ -96,12 +100,68 @@ You: 查看集群有哪些 node 节点
   那时 `console.print` 会把内容推到 Live 面板**上方**，不会打断正在刷新的面板。
 - 非终端环境（`python cli.py > log.txt`、管道输入）自动关闭 Live，改为结束后一次性打印，
   否则 Live 的反复整屏重画会把日志刷爆。
-- 启动时执行 `_bootstrap_console()`：Windows 控制台默认 GBK 代码页，`✅`/`🔧`/`🤖`
+- 启动时执行 `console_boot.bootstrap_console()`：Windows 控制台默认 GBK 代码页，`✅`/`🔧`/`🤖`
   会报 `UnicodeEncodeError` 或乱码，所以在**导入 rich 之前**把控制台代码页与
   Python 的 stdin/stdout/stderr 一起切成 UTF-8，并打开 ANSI 转义。
 
-因此有个约定：**入口脚本必须自己调 `_bootstrap_console()`**，而 `python -m agent`、
+因此有个约定：**入口脚本必须自己调 `console_boot.bootstrap_console()`**，而 `python -m agent`、
 `python -m tools.search` 这类自测代码只用 GBK 安全字符（中文 + ASCII），不打印 emoji。
+
+## 飞书入口
+
+```bash
+python -m feishu.feishu_bot        # 在项目根目录启动
+```
+
+启动前提（`.env` + 飞书开放平台）：
+
+```bash
+# .env
+FEISHU_APP_ID=cli_xxxxxxxxxxxx
+FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
+```
+
+1. 开发者后台 -> 你的应用 -> **事件订阅** -> 订阅方式选 **「长连接」**
+2. 订阅事件 **「接收消息 `im.message.receive_v1`」**
+3. 开通权限 `im:message`（发消息）、`im:message:send_as_bot`
+
+用**长连接**而不是 Webhook 的原因：事件订阅默认要求一个公网可回调的地址，长连接由客户端主动连飞书，
+本地开发不需要公网 IP 和内网穿透（见下方「与需求文档的差异」第 4 条）。
+
+### 一条消息答一轮：卡片 PATCH 刷新
+
+一轮问答只占用**一条**飞书消息，不会刷屏：
+
+```
+用户发问
+  └─ reply 一张「正在分析…」卡片  ──> 拿到 message_id
+         └─ 之后工具轨迹 / 流式回答都用 PATCH 刷新这条消息（节流 1.2s）
+                └─ 结束后再 PATCH 一次最终卡片（副标题变成「完成 · N 步工具调用 · X.Xs」）
+```
+
+卡片用**卡片 JSON 2.0**结构，正文是 `markdown` 组件，支持标题、表格、代码块、引用、分割线，
+所以 LLM 的回答**原样贴进去**就能正常渲染。工具轨迹放进 `collapsible_panel`，默认收起。
+副标题显示状态（`正在分析…` / `完成 · 3 步工具调用 · 12.4s` / `出错了`），失败时标题栏转红。
+
+### 线程与事件循环
+
+`lark-oapi` 的 `ws.Client.start()` 是「阻塞 + 自建事件循环」的，Agent 自己也需要一个事件循环，
+两者不能共用。因此分两条线：
+
+```
+主线程                        lark-ws 线程（daemon）
+agent_loop.run_forever()      ws_client.start()  —— 阻塞，负责协议与心跳
+     ↑                                |
+     |  run_coroutine_threadsafe       |  收到消息 -> 同步回调 on_message()
+     +--------------------------------+
+                 process_message(...)
+```
+
+事件回调**必须立刻返回**：它跑在 lark 自己的循环里，一旦在里面等 LLM（几十秒），心跳发不出去，
+连接会被飞书断掉。所以回调只做一件事——把协程投递到 `agent_loop` 就返回。
+
+会话记忆按 `thread_id = f"feishu:{chat_id}"` 隔离，每个群/私聊一份历史；发 `clear` / `重置` 清空当前会话。
+每条消息先经 `message_id` 去重（飞书会重投事件），群聊里只有被 @ 到才回应。
 
 ## 搜索工具（DuckDuckGo + 代理）
 
@@ -154,3 +214,19 @@ SEARCH_PROXY=http://127.0.0.1:7892     # 换成你本机代理的实际地址与
 - **`Live` 面板会重复打印**：`rich.Live.stop()` 在真机上会把最后一帧留在屏幕上，所以
   `stop()` 之后不能再 `console.print` 同一个面板，否则用户看到两遍。`cli.py` 用
   `if live is None` 把「流式渲染」与「一次性打印」两条路径分开，互不重叠。
+- **`lark_oapi` 在导入时就抓走了事件循环**：启动飞书长连接时报
+  `RuntimeError: This event loop is already running`。根因是 `lark_oapi/__init__.py` 第一行就是
+  `from . import ws`，而 `ws/client.py` 在**导入那一刻**执行 `asyncio.get_event_loop()` 把当前循环
+  存进模块级变量，`start()` 再用它 `run_until_complete(_connect())`。主线程先 `import lark_oapi`
+  时抓到的是 `agent_loop`，于是 WS 线程去跑一个主线程正在 `run_forever` 的循环。
+  解法：**lark 的一切导入都放进 WS 线程内**，并先给该线程 `asyncio.set_event_loop(new_event_loop())`
+  再导入（见 `_run_ws_client`）。
+- **飞书卡片渲染不出 Markdown**：卡片 JSON 1.0 的 `lark_md` 只支持行内语法，标题会显示成 `## xxx`、
+  表格会显示成一堆竖线。改成卡片 JSON 2.0（`schema: "2.0"` + `markdown` 组件）后，
+  除 HTMLBlock 外的标准 Markdown 都能渲染，原先那套「表格降级成列表」的转换代码整块删掉了。
+  两个注意点：2.0 只支持共享卡片（`config.update_multi` 只能为 `true`），而只有共享卡片才允许被
+  PATCH 更新，正好是我们要的；另外单个 `markdown` 组件里的换行是**软换行**，渲染时可能被忽略，
+  要保证一行一条就得拆成多个组件。
+- **卡片 JSON 无法离线校验**：想用 `cardkit.v1.card.create`（只建卡片实体、不发消息）校验卡片结构，
+  但应用未开通 `cardkit:card:write` 权限，返回 `99991672`。目前只能靠真实消息验证，
+  卡片结构出错时飞书 API 会在日志里回 `code=...`。
