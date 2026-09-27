@@ -20,8 +20,8 @@ cp .env.example .env    # 然后填写真实值
 python cli.py
 ```
 
-配置要点：LLM 用 `qwen-plus`（走 DashScope 兼容接口），搜索用 `tavily`（需 `TAVILY_API_KEY`，
-本机网络下 DuckDuckGo 不可达，见下方踩坑记录）。
+配置要点：LLM 用 `qwen-plus`（走 DashScope 兼容接口）；搜索用 `duckduckgo`（免费无需 Key），
+但在本机网络下必须走代理，需在 `.env` 里把 `SEARCH_PROXY` 填成你的代理地址（详见下方「搜索工具」）。
 
 ## 架构
 
@@ -65,6 +65,23 @@ Agent 核心层         agent.py
 | 6 | `feishu/feishu_bot.py` 飞书入口 | 待开始 |
 | 7 | 虚拟机开机后真机联调 | 待开始 |
 
+## 搜索工具（DuckDuckGo + 代理）
+
+搜索后端默认用 **DuckDuckGo**（免费、无需 Key）。它的底层后端包含 `search.yahoo.com`、
+`www.mojeek.com` 等域名，**在本机网络下均不可直连**，必须经代理访问：
+
+```bash
+# .env
+SEARCH_PROVIDER=duckduckgo
+SEARCH_PROXY=http://127.0.0.1:7892     # 换成你本机代理的实际地址与端口
+```
+
+实现上**没有**用全局 `HTTPS_PROXY`：那样会把 DashScope 的 LLM 调用也一起代理掉。改为把
+`SEARCH_PROXY` 显式传给 `ddgs.DDGS(proxy=...)`，作用域只限搜索。这也是没用
+`langchain-community` 的 `DuckDuckGoSearchResults` 的原因——它的封装不允许单次搜索传代理。
+
+备选方案是 Tavily（`SEARCH_PROVIDER=tavily` + `TAVILY_API_KEY`），它在本机网络可直连，无需代理。
+
 ## 与需求文档的差异（实现时的依据）
 
 1. **MCP 传输方式**：PDF §2.3 称使用 `streamable_http`，但 `mcp-k8s-eye` 实际以 **SSE** 提供服务（endpoint 以 `/sse` 结尾）。已按 SSE 实现，并把传输方式做成 `K8S_MCP_TRANSPORT` 配置项，切换时不改代码。
@@ -83,11 +100,13 @@ Agent 核心层         agent.py
 - **`requirements.txt` 中文注释导致 pip 失败**：中文 Windows 下 pip 用系统编码（cp936/GBK）读取该文件，含中文注释会抛 `UnicodeDecodeError`。已约定此文件只用 ASCII 注释，中文说明放本文档。Python 源文件不受影响（默认 UTF-8）。
 - **`mcp` 必须锁 1.x**：`langchain-mcp-adapters 0.2.1` 只声明 `mcp>=1.9.2` 没有上界，pip 会装 `mcp 2.x`，而 2.x 删掉了 `mcp.shared.context.RequestContext`，导致 `from langchain_mcp_adapters.client import MultiServerMCPClient` 直接 ImportError。已在 requirements 中加 `mcp<2`。
 - **`langgraph-prebuilt` 必须锁 1.0.8**：`langchain 1.2.10` 限制 `langgraph<1.1.0`，而 `langgraph-prebuilt` 从 1.0.9 起调用 `langgraph.runtime.ExecutionInfo`（langgraph 1.1 才引入），两者范围重叠但 API 不兼容，pip 默认装 1.0.13 会让 `from langchain.agents import create_agent` 报错。已锁 1.0.8。
-- **DuckDuckGo 在本机网络完全不可达**：实测其后端 `search.yahoo.com` 连接被拒绝（`os error 10061`），
-  而 `api.tavily.com` 返回 200。因此 `SEARCH_PROVIDER` 默认改为 **tavily**，需要去 tavily.com 申请
-  API Key（有免费额度）。`duckduckgo` 分支代码保留且可正常构造工具，换到可访问的网络环境即可用。
-- **`duckduckgo-search` 包名已失效**：`langchain-community 0.4.2` 的 DuckDuckGo 封装改成了
-  `import ddgs`，装旧的 `duckduckgo-search` 会抛 `Could not import ddgs python package`。
-  依赖里已换成 `ddgs`。
+- **DuckDuckGo 在本机网络必须走代理**：实测其全部后端域名（`search.yahoo.com`、`www.mojeek.com`
+  等）直连均超时或被拒；系统里虽配过代理 `127.0.0.1:7892` 但当前未启用（`ProxyEnable=0`，
+  端口无监听）。因此要用 DuckDuckGo 必须先打开代理并填 `SEARCH_PROXY`。已验证 `ddgs` 底层
+  遵守 `HTTP(S)_PROXY` 环境变量（用本地假代理抓到 CONNECT 请求），但为避免连带代理 DashScope，
+  项目改用显式传参。
+- **`duckduckgo-search` 包名已失效**：该包已改名为 `ddgs`，且 `langchain-community 0.4.2` 的
+  DuckDuckGo 封装也只认 `ddgs`。装旧包名会抛 `Could not import ddgs python package`。
+  依赖里装的是 `ddgs`。
 - **PDF 自身的版本矛盾**：§2.1 技术栈表写 `langgraph 1.1.x`，§4.2 具体版本写 `1.0.9`。经实测，`langchain 1.2.10` 的上界是 `<1.1.0`，因此以 **1.0.9** 为准，§2.1 表格的写法有误。
 - **`DASHSCOPE_API_KEY` 回退**：`.env` 里 `OPENAI_API_KEY` 为占位符时，`config.py` 自动回退读系统环境变量 `DASHSCOPE_API_KEY`，避免在文件里落盘明文密钥。
