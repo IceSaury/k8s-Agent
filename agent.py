@@ -40,6 +40,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from config import settings
 from prompts import SYSTEM_PROMPT
 from tools.mock_k8s import load_mock_tools
+from tools.search import TOOL_NAME as SEARCH_TOOL_NAME
 from tools.search import load_search_tools
 
 # MCP Server 在客户端里的标识名，与用户提供的 mcpServers 配置保持一致
@@ -221,13 +222,21 @@ class K8sAgent:
         graph = build_agent(model=model, tools=tools, checkpointer=checkpointer)
         return cls(graph=graph, tools=tools, k8s_source=k8s_source, checkpointer=checkpointer)
 
+    def tool_groups(self) -> tuple[list[str], list[str]]:
+        """按 (K8s 工具, 搜索工具) 分组返回展示名，供 CLI 启动信息与 tools 命令使用。
+
+        注意返回的是展示名（含空格，如 "resource list"），与 PDF §1.4 的输出一致。
+        """
+        k8s, search = [], []
+        for tool in self.tools:
+            display = self.display_names.get(tool.name, tool.name)
+            (search if tool.name == SEARCH_TOOL_NAME else k8s).append(display)
+        return sorted(k8s), sorted(search)
+
     def tool_names(self) -> list[str]:
-        """按原始名返回工具清单，供 CLI 的 tools 命令展示。"""
-        k8s = [self.display_names[t.name] for t in self.tools if t.name != "web_search"]
-        names = sorted(k8s)
-        if any(t.name == "web_search" for t in self.tools):
-            names.append("web_search")
-        return names
+        """全部工具的展示名，K8s 工具在前、搜索工具在后。"""
+        k8s, search = self.tool_groups()
+        return [*k8s, *search]
 
     def reset_memory(self, thread_id: str = DEFAULT_THREAD_ID) -> None:
         """清空某个会话的历史（CLI 的 clear 命令）。"""

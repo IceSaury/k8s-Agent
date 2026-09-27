@@ -57,13 +57,51 @@ Agent 核心层         agent.py
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 0 | 仓库初始化、依赖、配置模板 | ✅ |
-| 1 | `config.py` + `prompts.py` | 待开始 |
-| 2 | `tools/search.py` | 待开始 |
-| 3 | MCP 客户端接载与工具发现（含 mock 回退） | 待开始 |
-| 4 | `agent.py` Agent 组装 + 记忆 + 流式 | 待开始 |
-| 5 | `cli.py` 终端界面 | 待开始 |
+| 1 | `config.py` + `prompts.py` | ✅ |
+| 2 | `tools/search.py` | ✅ |
+| 3 | MCP 客户端接载与工具发现（含 mock 回退） | ✅ |
+| 4 | `agent.py` Agent 组装 + 记忆 + 流式 | ✅ |
+| 5 | `cli.py` 终端界面 | ✅ |
 | 6 | `feishu/feishu_bot.py` 飞书入口 | 待开始 |
 | 7 | 虚拟机开机后真机联调 | 待开始 |
+
+## CLI 使用
+
+```bash
+python cli.py
+```
+
+进入后直接提问即可，三个内置命令：
+
+| 命令 | 作用 |
+|---|---|
+| `quit` / `exit` / `q` | 退出（`Ctrl+C`、`Ctrl+D` 同效） |
+| `clear` | 清空对话历史，只清消息，不重载工具 |
+| `tools` | 表格列出全部工具及其来源（MCP / 本地搜索） |
+
+一轮问答的终端输出顺序（对应 PDF §1.4）：
+
+```
+You: 查看集群有哪些 node 节点
+  🔧 调用工具: node analyze  {"kind": "node"}
+     ✅ 工具返回完成  (0.8s)
+╭──────────────── Agent ────────────────╮
+│ （Markdown 渲染的回答，流式刷新）      │
+╰───────────────────────────────────────╯
+```
+
+实现要点：
+
+- 回答用 `rich.Live` + `Panel(Markdown(...))` 流式刷新。工具调用发生在回答生成之前，
+  那时 `console.print` 会把内容推到 Live 面板**上方**，不会打断正在刷新的面板。
+- 非终端环境（`python cli.py > log.txt`、管道输入）自动关闭 Live，改为结束后一次性打印，
+  否则 Live 的反复整屏重画会把日志刷爆。
+- 启动时执行 `_bootstrap_console()`：Windows 控制台默认 GBK 代码页，`✅`/`🔧`/`🤖`
+  会报 `UnicodeEncodeError` 或乱码，所以在**导入 rich 之前**把控制台代码页与
+  Python 的 stdin/stdout/stderr 一起切成 UTF-8，并打开 ANSI 转义。
+
+因此有个约定：**入口脚本必须自己调 `_bootstrap_console()`**，而 `python -m agent`、
+`python -m tools.search` 这类自测代码只用 GBK 安全字符（中文 + ASCII），不打印 emoji。
 
 ## 搜索工具（DuckDuckGo + 代理）
 
@@ -110,3 +148,9 @@ SEARCH_PROXY=http://127.0.0.1:7892     # 换成你本机代理的实际地址与
   依赖里装的是 `ddgs`。
 - **PDF 自身的版本矛盾**：§2.1 技术栈表写 `langgraph 1.1.x`，§4.2 具体版本写 `1.0.9`。经实测，`langchain 1.2.10` 的上界是 `<1.1.0`，因此以 **1.0.9** 为准，§2.1 表格的写法有误。
 - **`DASHSCOPE_API_KEY` 回退**：`.env` 里 `OPENAI_API_KEY` 为占位符时，`config.py` 自动回退读系统环境变量 `DASHSCOPE_API_KEY`，避免在文件里落盘明文密钥。
+- **Windows 控制台编码**：中文 Windows 控制台代码页是 GBK，输出 `•`（U+2022）等字符直接
+  `UnicodeEncodeError`。`cli.py` 在导入 rich 之前把控制台代码页与 Python 的 stdin/stdout/stderr
+  统一切到 UTF-8 解决；自测脚本因不做引导，只用 GBK 安全字符。
+- **`Live` 面板会重复打印**：`rich.Live.stop()` 在真机上会把最后一帧留在屏幕上，所以
+  `stop()` 之后不能再 `console.print` 同一个面板，否则用户看到两遍。`cli.py` 用
+  `if live is None` 把「流式渲染」与「一次性打印」两条路径分开，互不重叠。
