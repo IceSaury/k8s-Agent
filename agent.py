@@ -29,7 +29,7 @@ import asyncio
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
@@ -55,13 +55,77 @@ def _sanitize_tool_name(raw_name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z_-]", "_", raw_name)
 
 
+# "全部命名空间"的常见写法。本项目的 MCP Server 只认空字符串：这些写法会被当成
+# 真实的命名空间名去查、返回空列表（LLM 爱写 "all"，因为它习惯 kubectl 的 -A）
+_ALL_NAMESPACES = {"all", "*", "-a", "all-namespaces", "all_namespaces", "--all-namespaces"}
+
+# 这些工具缺少 namespace 时，服务端会掐掉连接、一个字节都不回（客户端只能干等到超时）。
+# 补空字符串是安全的：它们都是只读工具，且空串表示"全部命名空间"
+_NAMESPACE_FALLBACK_TOOLS = {"resource_list"}
+
+
+def _fix_namespace_args(tool_name: str, kwargs: dict) -> dict:
+    """
+    入参兜底，两件事：
+
+    1. `namespace="all"` 这类写法改成 `""`——服务端不认 "all"，会返回空列表，
+       LLM 拿到空列表容易误判成"集群里没有资源"，然后一路瞎猜（真的踩过）。
+    2. `resource list` 缺 namespace 时补 `""`——该 Server 缺参数就不响应，
+       补一个安全的默认值比白白等一次超时强。
+    """
+    if "namespace" not in kwargs:
+        if tool_name in _NAMESPACE_FALLBACK_TOOLS:
+            print(f"  [WARN] {tool_name} 缺少 namespace，已补 '' （表示全部命名空间）")
+            return {**kwargs, "namespace": ""}
+        return kwargs
+
+    value = kwargs["namespace"]
+    if isinstance(value, str) and value.strip().lower() in _ALL_NAMESPACES:
+        print(f"  [WARN] {tool_name} 的 namespace={value!r} 已改为 ''（该 Server 用空字符串表示全部命名空间）")
+        return {**kwargs, "namespace": ""}
+    return kwargs
+
+
+def _harden_tool(tool: BaseTool) -> None:
+    """
+    给工具包一层"入参兜底 + 调用超时"。
+
+    包装点在 tool.coroutine（StructuredTool 的异步实现），调用链是：
+        ToolNode -> tool.ainvoke -> StructuredTool._arun -> self.coroutine(**args)
+    在这里既能拿到 LLM 传进来的参数，又能把整个网络调用罩住。
+
+    只有异步工具（MCP 工具）才有 coroutine；本地的 web_search 与 mock 工具是同步函数，
+    这里会直接跳过——它们本来就有自己的超时，也不会挂死。
+    """
+    original = tool.coroutine
+    if original is None:
+        return
+
+    async def hardened(*args: Any, **kwargs: Any) -> Any:
+        args_fixed = _fix_namespace_args(tool.name, kwargs)
+        try:
+            return await asyncio.wait_for(
+                original(*args, **args_fixed), timeout=settings.tool_call_timeout
+            )
+        except asyncio.TimeoutError as exc:
+            # 抛普通异常即可：LangGraph 的 ToolNode 会把错误文本作为工具结果回给 LLM，
+            # 让它自己换个工具或换组参数重试，而不是让整轮对话一直挂着
+            raise TimeoutError(
+                f"调用工具 {tool.name} 超过 {settings.tool_call_timeout} 秒没有任何返回，"
+                "已中止本次调用。可能是该工具对当前入参不响应，请换用其他工具或换个参数重试。"
+            ) from exc
+
+    tool.coroutine = hardened
+
+
 def _prepare_tools(raw_tools: list[BaseTool]) -> list[BaseTool]:
-    """净化工具名，并把原始名记进 metadata 供展示。"""
+    """工具统一后处理：净化工具名、把原始名记进 metadata、并做加固（兜底 + 超时）。"""
     for tool in raw_tools:
         original = tool.metadata.get("mcp_name") if tool.metadata else None
         if original is None:
             tool.metadata = {**(tool.metadata or {}), "mcp_name": tool.name}
         tool.name = _sanitize_tool_name(tool.name)
+        _harden_tool(tool)
     return raw_tools
 
 

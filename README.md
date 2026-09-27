@@ -67,7 +67,7 @@ Agent 核心层         agent.py
 | 4 | `agent.py` Agent 组装 + 记忆 + 流式 | ✅ |
 | 5 | `cli.py` 终端界面 | ✅ |
 | 6 | `feishu/feishu_bot.py` 飞书入口 | ✅ |
-| 7 | 虚拟机开机后真机联调 | 待开始 |
+| 7 | 虚拟机开机后真机联调（含 MCP 工具调用加固） | ✅ |
 
 ## CLI 使用
 
@@ -87,7 +87,7 @@ python cli.py
 
 ```
 You: 查看集群有哪些 node 节点
-  🔧 调用工具: node analyze  {"kind": "node"}
+  🔧 调用工具: resource list  {"kind": "Node", "namespace": ""}
      ✅ 工具返回完成  (0.8s)
 ╭──────────────── Agent ────────────────╮
 │ （Markdown 渲染的回答，流式刷新）      │
@@ -180,12 +180,45 @@ SEARCH_PROXY=http://127.0.0.1:7892     # 换成你本机代理的实际地址与
 
 备选方案是 Tavily（`SEARCH_PROVIDER=tavily` + `TAVILY_API_KEY`），它在本机网络可直连，无需代理。
 
+## MCP 工具调用加固（真机联调后补的三道闸门）
+
+真机联调第一次提问就翻车：一句"查看集群有哪些节点和正在运行的 pods"跑了 **431 秒**，
+最后还得出"pods 为空"的错误结论。排查下来两个根因都在 Server 侧（不是模型的锅），对策分三层：
+
+| 现象 | 根因 | 对策 |
+|---|---|---|
+| 结论错：报告集群里没有 pods | LLM 按 kubectl 的习惯传 `namespace="all"`，而 Server 把它当**字面命名空间名**去查，返回空列表；空列表又被 LLM 当成"确实没有" | `agent.py` 的 `_fix_namespace_args()` 把 `all`/`*`/`-a`/`all-namespaces` 一律改写成 `""`（Server 用空串表示"全部命名空间"），并打 `[WARN]` 留痕 |
+| 挂死：整轮对话 431s 没有响应 | `resource list` 缺 `namespace` 时 Server 直接掐断连接，一个字节都不回，客户端只能干等 | ① 同样在 `_fix_namespace_args()` 里给 `resource_list` 补 `""`；② `_harden_tool()` 给每次工具调用套 `asyncio.wait_for(TOOL_CALL_TIMEOUT)` |
+| 绕远路：`* analyze` 返回空后一路瞎猜 | 本机部署的 Server 上 `node analyze`/`pod analyze` 恒返回 `[]`，`deployment analyze`/`service analyze` 恒返回 `null` | `prompts.py` 新增「已知的工具坑」一节，明确告诉模型：列资源走 `resource list(kind, namespace)`，`* analyze` 返回空**不代表**资源不存在 |
+
+包装点选在 `tool.coroutine`（`StructuredTool` 的异步实现）上，调用链是：
+
+```
+ToolNode._arun_one -> tool.ainvoke(...) -> StructuredTool._arun(...) -> self.coroutine(**args)
+```
+
+在这里既能拿到 LLM 传来的实参做兜底，又能把整个网络调用罩进超时；本地同步工具（`web_search`、
+mock 工具）的 `coroutine is None`，会被自动跳过，不受影响。超时抛的是普通 `TimeoutError`，
+LangGraph 的 `ToolNode` 会把错误文本当作**工具结果**回给 LLM，让它换工具或换参数重试，
+而不是让整轮对话一直挂着。
+
+效果（同一句提问"查看集群有哪些节点和正在运行的 pods"）：
+
+| | 加固前 | 加固后 |
+|---|---|---|
+| 总耗时 | 431.4s | 36.2s |
+| 工具调用次数 | 7 次（前 4 次全空） | 2 次（各命中一次） |
+| 实际入参 | `namespace: "all"` | `namespace: ""` |
+| 结论 | pods 为空（错） | 3 节点 / 23 个 pods（对） |
+
 ## 与需求文档的差异（实现时的依据）
 
 1. **MCP 传输方式**：PDF §2.3 称使用 `streamable_http`，但 `mcp-k8s-eye` 实际以 **SSE** 提供服务（endpoint 以 `/sse` 结尾）。已按 SSE 实现，并把传输方式做成 `K8S_MCP_TRANSPORT` 配置项，切换时不改代码。
 2. **参考代码缺失**：PDF §5「完整代码实现」只有一个 `k8s-ops-agent-cli.zip` 附件链接，PDF 内无可提取代码，全部代码从零实现。
 3. **Python 版本**：PDF 用 3.11.3，本机 venv 为 3.12.8，上述依赖版本均兼容。
 4. **飞书连接方式**：飞书事件订阅默认要求公网回调地址，本地开发不便。改用 `lark-oapi` 的 **WebSocket 长连接**模式，无需公网 IP 与内网穿透。
+5. **`* analyze` 系列在本机 Server 上不可用**：PDF §1.4 把 19 个工具并列展示，示例回答也像是分析工具的产物。实测本机部署的 `mcp-k8s-eye` 上：`node analyze` / `pod analyze` 恒返回空数组 `[]`，`deployment analyze` / `service analyze` 恒返回 `null`。真正可用的是 `resource list` / `resource describe` / `resource get` / `pod logs`。因此提示词里把 `resource list` 定为主路径，并明确"`* analyze` 返回空 ≠ 资源不存在"。
+6. **`resource list` 的入参语义与 kubectl 不同**：只接受 `kind` + `namespace` 两个参数（无 `apiVersion`）。`namespace=""` 表示全部命名空间；传 `"all"` 会被当成名为 "all" 的命名空间、返回空列表；**缺 `namespace` 时 Server 不返回任何响应**（连接被掐断，客户端一直挂着）。README 上面「MCP 工具调用加固」一节的三道闸门就是为这两条设计的。
 
 ## 安全提示
 
@@ -230,3 +263,14 @@ SEARCH_PROXY=http://127.0.0.1:7892     # 换成你本机代理的实际地址与
 - **卡片 JSON 无法离线校验**：想用 `cardkit.v1.card.create`（只建卡片实体、不发消息）校验卡片结构，
   但应用未开通 `cardkit:card:write` 权限，返回 `99991672`。目前只能靠真实消息验证，
   卡片结构出错时飞书 API 会在日志里回 `code=...`。
+- **一次提问 431 秒，锅不在模型**：起初怀疑 qwen-plus 慢，逐次给工具调用计时后才发现时间全花在
+  等 MCP Server 上——Server 掐断连接后不回任何数据，客户端也没有超时，就这么一直挂着。
+  `K8S_MCP_TIMEOUT` 只管**工具发现**阶段，不管单次工具调用，这是两码事。已加
+  `TOOL_CALL_TIMEOUT`（默认 30s）罩住每次调用。
+- **"参数写错但服务端不报错、只返回空"是最危险的坑**：`namespace="all"` 不会被 Server 拒绝，
+  它只是查不到东西、返回 `[]`。Agent 拿到空结果后不会说"我参数写错了"，而是开始编故事
+  （怀疑权限、怀疑 etcd、怀疑静态 Pod），越查越偏。这类坑必须**提示词 + 客户端**双管：
+  提示词告诉模型正确写法，客户端 `_fix_namespace_args()` 再兜一层，兜住时打 `[WARN]` 留痕。
+- **`node analyze` 恒返回空**：PDF §1.4 的工具清单里它排在最前，直觉上该用它列节点，
+  实测本机 Server 上 `node analyze`/`pod analyze` 返回 `[]`、`deployment analyze`/`service analyze`
+  返回 `null`。别在它身上浪费时间，列资源统一用 `resource list`。
