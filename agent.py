@@ -292,6 +292,48 @@ def _trim_list_result(result: Any) -> Any:
     return _rebuild_text(result, body + _TRIM_NOTE)
 
 
+# ---------------------------------------------------------------------------
+# 工具说明补充：把"本环境这一个 Server 的事实"写回工具自己头上
+#
+# 这些内容原先写在 SYSTEM_PROMPT 的「已知的工具坑」一节里，挪出来的理由：
+#   1. 它们不是方法论，是**当前这台 mcp-k8s-eye 的接口事实**。换一台 Server 就可能变成
+#      错的指令，而提示词里看不出"这条是为谁写的"，改错了都没人知道。
+#   2. 模型是在决定调用某个工具的那一刻读它的 description 的，比让它回忆提示词第三节可靠。
+#   3. 工具没加载（比如换回 mock）时，说明不会凭空留在上下文里误导它。
+# 与 _fix_namespace_args 的关系：那三层兜底是**强制**的（改参数、加超时、裁结果），
+# 这里的说明是**告知**的——告诉模型为什么会被改，以及本来就该怎么传，两者不冲突。
+# ---------------------------------------------------------------------------
+
+_LIST_NOTE = (
+    "\n【本环境入参约定】只有 kind 与 namespace 两个参数（没有 apiVersion）。"
+    "kind 用单数大写形式，如 Pod、Node、Deployment、Service、Namespace。"
+    "查全部命名空间时 namespace 传空字符串 \"\"；传 \"all\" 或 \"*\" 会被当成真实的命名空间名，"
+    "返回空列表——那是参数写错了，不代表集群里没有资源。"
+    "本工具返回的是精简视图（探针、挂载等字段已省略），要完整定义请用 resource describe。"
+)
+
+# `* analyze` 家族在本 Server 上普遍不返回内容（实测：node/pod analyze 恒为 []，
+# deployment/service analyze 恒为 null），但模型会把"空"当成事实去编结论。
+# 这条要复制 11 份（每个 analyze 工具一份），所以按字计费——一句话说清"空不可信 + 该用谁"。
+_ANALYZE_NOTE = (
+    "\n【本环境已知限制】本集群下该工具经常返回空（[] 或 null），即使资源存在；"
+    "空结果不可作为结论依据，清单请用 resource list、细节请用 resource describe。"
+)
+
+# 直接按净化后的工具名精确匹配（空格已被换成下划线）
+_TOOL_NOTES: dict[str, str] = {"resource_list": _LIST_NOTE}
+
+
+def _annotate_tool(tool: BaseTool) -> None:
+    """把环境相关的说明追加到工具描述末尾。只追加，绝不覆盖 Server 自己给的描述。"""
+    note = _TOOL_NOTES.get(tool.name)
+    if note is None and tool.name.endswith("_analyze"):
+        note = _ANALYZE_NOTE
+    if note is None:
+        return
+    tool.description = f"{tool.description}{note}"
+
+
 def _harden_tool(tool: BaseTool) -> None:
     """
     给工具包三层："入参兜底 + 调用超时 + 结果瘦身"。
@@ -329,12 +371,13 @@ def _harden_tool(tool: BaseTool) -> None:
 
 
 def _prepare_tools(raw_tools: list[BaseTool]) -> list[BaseTool]:
-    """工具统一后处理：净化工具名、把原始名记进 metadata、并做加固（兜底 + 超时 + 瘦身）。"""
+    """工具统一后处理：净化工具名、把原始名记进 metadata、补充工具说明、并做加固（兜底 + 超时 + 瘦身）。"""
     for tool in raw_tools:
         original = tool.metadata.get("mcp_name") if tool.metadata else None
         if original is None:
             tool.metadata = {**(tool.metadata or {}), "mcp_name": tool.name}
         tool.name = _sanitize_tool_name(tool.name)
+        _annotate_tool(tool)
         _harden_tool(tool)
     return raw_tools
 

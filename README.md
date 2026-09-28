@@ -48,9 +48,9 @@ Agent 核心层         agent.py
 |---|---|
 | `config.py` | 读取 `.env`，集中管理 LLM / MCP Server / 搜索 / 飞书 配置。所有魔法值只在这里出现一次 |
 | `console_boot.py` | 控制台 UTF-8 引导，两个入口共用，必须在导入 rich 之前调用 |
-| `prompts.py` | K8s SRE 专家系统提示词 |
+| `prompts.py` | K8s SRE 专家系统提示词。只放**环境无关**的方法论与表达规范，Server 的接口事实挂到工具描述上（见「提示词与环境事实分层」） |
 | `tools/search.py` | 搜索工具封装，`duckduckgo` 与 `tavily` 可切换 |
-| `agent.py` | 初始化 MCP 客户端、发现并加载工具、创建 Agent、管理对话记忆、流式输出 |
+| `agent.py` | 初始化 MCP 客户端、加载工具（含环境说明补充 `_TOOL_NOTES` 与加固 `_harden_tool`）、创建 Agent、管理对话记忆、流式输出 |
 | `cli.py` | 终端交互循环、`quit` / `clear` / `tools` 命令、工具调用过程可视化 |
 | `feishu/feishu_bot.py` | 飞书机器人入口，长连接接收事件、卡片形式回复 |
 
@@ -246,7 +246,7 @@ SEARCH_PROXY=http://127.0.0.1:7892     # 换成你本机代理的实际地址与
 |---|---|---|
 | 结论错：报告集群里没有 pods | LLM 按 kubectl 的习惯传 `namespace="all"`，而 Server 把它当**字面命名空间名**去查，返回空列表；空列表又被 LLM 当成"确实没有" | `agent.py` 的 `_fix_namespace_args()` 把 `all`/`*`/`-a`/`all-namespaces` 一律改写成 `""`（Server 用空串表示"全部命名空间"），并打 `[WARN]` 留痕 |
 | 挂死：整轮对话 431s 没有响应 | `resource list` 缺 `namespace` 时 Server 直接掐断连接，一个字节都不回，客户端只能干等 | ① 同样在 `_fix_namespace_args()` 里给 `resource_list` 补 `""`；② `_harden_tool()` 给每次工具调用套 `asyncio.wait_for(TOOL_CALL_TIMEOUT)` |
-| 绕远路：`* analyze` 返回空后一路瞎猜 | 本机部署的 Server 上 `node analyze`/`pod analyze` 恒返回 `[]`，`deployment analyze`/`service analyze` 恒返回 `null` | `prompts.py` 新增「已知的工具坑」一节，明确告诉模型：列资源走 `resource list(kind, namespace)`，`* analyze` 返回空**不代表**资源不存在 |
+| 绕远路：`* analyze` 返回空后一路瞎猜 | 本机部署的 Server 上 `node analyze`/`pod analyze` 恒返回 `[]`，`deployment analyze`/`service analyze` 恒返回 `null` | 在该类工具的 `description` 里追加「本环境已知限制」，明确告诉模型：`* analyze` 返回空**不代表**资源不存在（原先写在 `prompts.py` 的「已知的工具坑」一节，后来按下面的「提示词与环境事实分层」挪到了工具上） |
 
 包装点选在 `tool.coroutine`（`StructuredTool` 的异步实现）上，调用链是：
 
@@ -271,6 +271,41 @@ LangGraph 的 `ToolNode` 会把错误文本当作**工具结果**回给 LLM，�
 | 工具调用次数 | 7 次（前 4 次全空） | 2 次（各命中一次） |
 | 实际入参 | `namespace: "all"` | `namespace: ""` |
 | 结论 | pods 为空（错） | 3 节点 / 23 个 pods（对） |
+
+## 提示词与环境事实分层（不要把 Server 的坑写进人设）
+
+上面三道闸门里，第三道的"告知"部分原本全写在 `prompts.py` 的「已知的工具坑」一节里：
+`resource list` 只有 `kind`+`namespace` 两个参数、`namespace=""` 才是全量、传 `"all"` 会得到
+空列表、`* analyze` 恒返回空。功能上没问题，但这么写有三处隐患：
+
+1. **它们是"这台 `mcp-k8s-eye` 的事实"，不是方法论。** 换一个 Server（或对方修好了 bug）
+   这些句子就变成错的指令，而提示词里看不出"这条是为谁写的"，改错了没人知道。
+2. **模型是在决定调用某个工具的那一刻读 `description` 的**，比让它回忆提示词第三节更贴合时机。
+3. **工具没加载时说明不该留在上下文里。** 写在提示词里就永远在，哪怕这次根本没挂这个工具。
+
+于是分工改成：
+
+| 位置 | 放什么 | 判据 |
+|---|---|---|
+| `prompts.py` `SYSTEM_PROMPT` | 角色、先取证再结论、"空结果先怀疑参数再怀疑集群"、写操作交代后果、回答篇幅规范 | 换一台集群、换一个模型都仍然成立 |
+| `agent.py` `_TOOL_NOTES` → 追加进 `tool.description` | 某个工具的入参语义、某个工具在本环境的已知故障 | 只对当前这个 Server 成立 |
+| `agent.py` `_fix_namespace_args` / `wait_for` / `_trim_list_result` | 强制兜底：改参数、加超时、裁结果 | 不依赖模型听不听话 |
+
+装载点在 `_prepare_tools()`（工具名净化之后、加固之前调 `_annotate_tool()`），**只追加、
+不覆盖** Server 自己给的描述。`* analyze` 那条按 `tool.name.endswith("_analyze")` 匹配，
+所以现在 19 个 K8s 工具里 12 个带环境说明。
+
+`_TRIM_NOTE`（拼在瘦身后的结果末尾）与 `_LIST_NOTE`（拼在 `resource list` 描述里）故意保留
+了一点重复：前者管"读到结果时别把精简字段当成集群没有"，后者管"选工具时就知道要看完整定义
+该用 describe"。
+
+篇幅那一段同时做了去特例化：把「清单类问题散文不超过 200 字」这种**替模型预设问题分类**
+的写法，换成与问题类型无关的判据——结论先行、表格承载对象、表格之后只解释异常、
+**篇幅由"需要展开的对象数量"决定而不是由问题听起来大不大决定**。数字型约束（表格 ≤5 列、
+下一步命令 ≤2 条）保留，因为可判定的约束才起作用，"请简洁回答"这类没有判定边界。
+
+效果（同一句"查看集群有哪些节点"，flash + 真机）：提示词从 2278 字降到 1664 字（−27%），
+单轮 12.1s / 1 次工具调用 / 648 字，结论与表格仍然正确——去环境化没有让行为退化。
 
 ## 对话记忆治理（轮数窗口 + 旧工具结果清理 + 当轮结果瘦身）
 
@@ -366,7 +401,7 @@ checkpointer 会把每轮 **ToolMessage 的原文**一起存档。`resource list
 2. **参考代码缺失**：PDF §5「完整代码实现」只有一个 `k8s-ops-agent-cli.zip` 附件链接，PDF 内无可提取代码，全部代码从零实现。
 3. **Python 版本**：PDF 用 3.11.3，本机 venv 为 3.12.8，上述依赖版本均兼容。
 4. **飞书连接方式**：飞书事件订阅默认要求公网回调地址，本地开发不便。改用 `lark-oapi` 的 **WebSocket 长连接**模式，无需公网 IP 与内网穿透。
-5. **`* analyze` 系列在本机 Server 上不可用**：PDF §1.4 把 19 个工具并列展示，示例回答也像是分析工具的产物。实测本机部署的 `mcp-k8s-eye` 上：`node analyze` / `pod analyze` 恒返回空数组 `[]`，`deployment analyze` / `service analyze` 恒返回 `null`。真正可用的是 `resource list` / `resource describe` / `resource get` / `pod logs`。因此提示词里把 `resource list` 定为主路径，并明确"`* analyze` 返回空 ≠ 资源不存在"。
+5. **`* analyze` 系列在本机 Server 上不可用**：PDF §1.4 把 19 个工具并列展示，示例回答也像是分析工具的产物。实测本机部署的 `mcp-k8s-eye` 上：`node analyze` / `pod analyze` 恒返回空数组 `[]`，`deployment analyze` / `service analyze` 恒返回 `null`。真正可用的是 `resource list` / `resource describe` / `resource get` / `pod logs`。因此 `resource list` 的 `description` 里写明它是列资源的主路径，`* analyze` 系列的 `description` 里写明"返回空 ≠ 资源不存在"（见「提示词与环境事实分层」一节）。
 6. **`resource list` 的入参语义与 kubectl 不同**：只接受 `kind` + `namespace` 两个参数（无 `apiVersion`）。`namespace=""` 表示全部命名空间；传 `"all"` 会被当成名为 "all" 的命名空间、返回空列表；**缺 `namespace` 时 Server 不返回任何响应**（连接被掐断，客户端一直挂着）。README 上面「MCP 工具调用加固」一节的三道闸门就是为这两条设计的。
 
 ## 安全提示
@@ -419,7 +454,7 @@ checkpointer 会把每轮 **ToolMessage 的原文**一起存档。`resource list
 - **"参数写错但服务端不报错、只返回空"是最危险的坑**：`namespace="all"` 不会被 Server 拒绝，
   它只是查不到东西、返回 `[]`。Agent 拿到空结果后不会说"我参数写错了"，而是开始编故事
   （怀疑权限、怀疑 etcd、怀疑静态 Pod），越查越偏。这类坑必须**提示词 + 客户端**双管：
-  提示词告诉模型正确写法，客户端 `_fix_namespace_args()` 再兜一层，兜住时打 `[WARN]` 留痕。
+  `resource list` 的说明告诉模型正确写法，客户端 `_fix_namespace_args()` 再兜一层，兜住时打 `[WARN]` 留痕。
 - **`node analyze` 恒返回空**：PDF §1.4 的工具清单里它排在最前，直觉上该用它列节点，
   实测本机 Server 上 `node analyze`/`pod analyze` 返回 `[]`、`deployment analyze`/`service analyze`
   返回 `null`。别在它身上浪费时间，列资源统一用 `resource list`。
