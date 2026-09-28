@@ -29,14 +29,29 @@ lark-oapi 提供的 WebSocket 长连接模式由客户端主动连飞书，不�
     事件回调必须**立刻返回**：它跑在 lark 自己的循环里，一旦在里面做 LLM 调用（几十秒），
     心跳发不出去，连接会被飞书断掉。所以回调只做一件事——把协程投递到 agent_loop 就返回。
 
-## 卡片刷新
+## 卡片刷新：飞书原生流式更新
 
-一轮问答只占用一条飞书消息：先 reply 一张「正在分析…」卡片拿到 message_id，
-之后工具调用与流式回答都用 PATCH 刷新同一张卡片，避免刷屏。
+一轮问答只占用**一条**飞书消息，避免刷屏。走的是官方「流式更新卡片」通道：
 
-刷新由 CardReply 的**后台协程**按 PATCH_INTERVAL 的节奏做，不在消费 token 的循环里
-await。原因见 CardReply 的文档字符串：PATCH 是一次真实 HTTPS 往返，写在 token 循环里
-会把流打断成"冻结 -> 蹦一大块"，这正是之前流式输出卡顿的来源。
+```
+建卡片实体(cardkit.v1.card.create) -> 拿 card_id
+   └─ 用 card_id 回复消息(im.v1.message.reply)
+        └─ 后台协程循环 cardkit.v1.card_element.content(card_id, element_id, 全量文本, sequence++)
+             └─ 收尾推最终文本，再 cardkit.v1.card.settings 关 streaming_mode
+```
+
+三个必须照做的约定（真机探针实测）：
+  - `content` 传**累计全量文本**，不是增量，增量由飞书计算；
+  - `sequence` 在整张卡片生命周期内严格递增，内容更新与收尾的设置更新**共用同一个计数器**；
+  - 收尾不调 `settings` 关掉 `streaming_mode`，客户端会一直挂着"生成中"的打字光标。
+
+前置条件是应用要有 **`cardkit:card:write`** 权限（建卡片实体用的），缺它会在创建时报
+`99991672`；另外能承载流式文本的组件只有 `plain_text` / `markdown`，且该组件必须自带
+`element_id`，所以整张卡只剩一个正文元素——工具轨迹也拼进这段文本，原先的折叠面板取消了。
+
+推送由 `CardReply` 的**后台协程**按 `STREAM_INTERVAL` 的节奏做，不在消费 token 的循环里
+await。原因见 `CardReply` 的文档字符串：一次更新是实打实的 HTTPS 往返（实测约 0.6s），
+写在 token 循环里会把流打断成"冻结 -> 蹦一大块"，这正是之前流式输出卡顿的来源。
 
 卡片用 **卡片 JSON 2.0** 结构（见 build_card）：2.0 的 markdown 组件支持全部标准
 Markdown，LLM 的回答可以原样贴进去。注意 2.0 的卡片必须是共享卡片
@@ -46,6 +61,7 @@ Markdown，LLM 的回答可以原样贴进去。注意 2.0 的卡片必须是共
     1. 开启「事件订阅」-> 订阅方式选「长连接」
     2. 订阅事件「接收消息 im.message.receive_v1」
     3. 开通权限 im:message（发消息）、im:message:send_as_bot
+    4. 开通权限 cardkit:card:write（建卡片实体，流式更新靠它），改完要发布新版本才生效
 """
 
 from __future__ import annotations
@@ -67,9 +83,14 @@ from config import settings  # noqa: E402
 # 卡片里最多显示多少行工具轨迹，超出的折叠成一行汇总
 MAX_TRACE_LINES = 12
 
-# 后台刷新卡片的时间闸（秒）。飞书对消息更新有频率限制，刷太快会被限流；
-# 但被限流只是丢一帧（流式 PATCH 走 quiet=True，失败不影响回答），所以下限取 0.4
-PATCH_INTERVAL = 0.4
+# 承载流式正文的 markdown 组件 id。飞书要求流式组件自带自定义 element_id，
+# 流式更新接口就是按 /cards/{card_id}/elements/{element_id}/content 定位的
+STREAM_ELEMENT_ID = "agent_answer"
+
+# 后台推送流式帧的时间闸（秒）。实测单次更新往返约 0.6s，所以真正的帧率是
+# 1/(闸+往返)≈1 次/秒，仍远低于官方的 10 次/秒限制；调小这个值收益有限，
+# 因为它会被往返时间吃掉。
+STREAM_INTERVAL = 0.3
 
 # 单条提问最多取多少字符，防止有人粘贴一整篇日志把上下文撑爆
 MAX_INPUT_CHARS = 1000
@@ -140,11 +161,11 @@ def _tool_label(name: str) -> str:
 
 
 def build_card(
-    trace: list[str],
     body: str,
     *,
     subtitle: str = "",
     template: str = "blue",
+    streaming: bool = True,
 ) -> dict:
     """
     拼一张飞书卡片（卡片 JSON 2.0 结构）。
@@ -154,40 +175,33 @@ def build_card(
     1.0 的 lark_md 只支持行内语法，标题会显示成 "## xxx"、表格会显示成一堆竖线，
     之前那套"表格转列表"的降级转换就是为了绕开它，换到 2.0 后整块删掉了。
 
-    结构分三块：config（卡片行为）、header（标题栏）、body（正文元素）。
-    执行过程放进折叠面板，默认收起，避免抢走回答的视觉重心。
+    streaming=True 表示这张卡交给**流式更新接口**逐帧刷新，需满足官方列的两个前置条件：
+      - config.streaming_mode = true，且 update_multi 不为 false（共享卡片）
+      - 能流式的组件只有 plain_text / markdown，且该组件必须自带自定义 element_id
+    于是整张卡只剩一个正文元素，工具轨迹也得拼进这段文本，原先的可折叠面板取消。
+    两条快速回复（非文字输入提示、/clear 确认）不参与流式，用 streaming=False。
     """
-    elements: list[dict] = []
+    answer: dict = {"tag": "markdown", "content": body or "🔍 正在分析，请稍候…"}
+    if streaming:
+        answer["element_id"] = STREAM_ELEMENT_ID
 
-    if trace:
-        elements.append(
-            {
-                "tag": "collapsible_panel",
-                "expanded": False,  # 默认收起，不抢回答的视觉重心
-                "background_color": "grey",
-                "header": {"title": {"tag": "markdown", "content": f"**执行过程（{len(trace)} 步）**"}},
-                "border": {"color": "grey", "corner_radius": "6px"},
-                # 一行一个 markdown 组件：单个组件里用 \n 换行属于软换行，
-                # 渲染器可能忽略，拆成多个组件才能保证一行一条
-                "elements": [{"tag": "markdown", "content": line} for line in trace],
-            }
-        )
-
-    elements.append({"tag": "markdown", "content": body or "🔍 正在分析，请稍候…"})
+    config: dict = {
+        # 2.0 只支持共享卡片（update_multi 只能为 true），共享卡片才允许被反复更新
+        "update_multi": True,
+        "width_mode": "fill",  # 撑满聊天窗口，宽表格才放得下
+        "summary": {"content": "K8s 运维助手的回答"},
+    }
+    if streaming:
+        config["streaming_mode"] = True
 
     card: dict = {
         "schema": "2.0",
-        "config": {
-            # 2.0 只支持共享卡片（update_multi 只能为 true），共享卡片才允许被 PATCH 更新
-            "update_multi": True,
-            "width_mode": "fill",  # 撑满聊天窗口，宽表格才放得下
-            "summary": {"content": "K8s 运维助手的回答"},
-        },
+        "config": config,
         "header": {
             "template": template,
             "title": {"tag": "plain_text", "content": "K8s 运维助手"},
         },
-        "body": {"elements": elements},
+        "body": {"elements": [answer]},
     }
     if subtitle:
         card["header"]["subtitle"] = {"tag": "plain_text", "content": subtitle}
@@ -200,20 +214,27 @@ def build_card(
 
 class CardReply:
     """
-    挂在一条飞书卡片消息上的回复器。
+    一条问答对应一张**流式卡片**的回复器。
 
-    工具调用与回答片段都只更新到内存状态，卡片由一个后台协程按 PATCH_INTERVAL
-    取"当前最新快照"推出去。最终结果由 flush() 强制推送。
+    一轮的生命周期：建卡片实体拿 card_id -> 用 card_id 回复消息 -> 后台协程按
+    STREAM_INTERVAL 往 card_id 的那个 markdown 元素推**全量文本**（sequence 严格递增）
+    -> 收尾推最终文本，再调设置接口关掉 streaming_mode。
 
-    为什么刷新不能写在 token 循环里：PATCH 是一次真实的 HTTPS 往返（约 0.2~0.5s），
-    在 `async for event in bot.astream(...)` 里 await 它，这段时间 token 循环是挂起的、
-    消费不了模型输出，token 只能堆在缓冲区等请求回来一次性吐出——回答就变成
-    "冻结一秒多 -> 蹦出一大块字"。所以这里把网络彻底挪出主循环，token 侧只做内存累加。
+    三个容易踩错的点：
+      - content 是**累计全量**，不是增量；增量由飞书自己算，我们只管把当前完整文本推上去。
+      - sequence 必须在整张卡片的生命周期内严格递增，内容更新和最后的设置更新**共用这一个
+        计数器**，所以统一走 _next_seq()。
+      - 结束时必须调 settings 关流式，否则客户端会一直挂着"生成中"的打字光标。
+
+    为什么推送放在后台协程、而不是写在 token 循环里：一次更新是实打实的 HTTPS 往返
+    （实测约 0.6s），在 `async for event in bot.astream(...)` 里 await 它，token 循环这段时间
+    是挂起的、消费不了模型输出，token 堆在缓冲区等请求回来一次性吐出——观感就变成
+    "冻结一秒多 -> 蹦出一大块字"。所以网络全部挪出主循环，token 侧只做内存累加。
     """
 
-    def __init__(self, message_id: str, chat_id: str):
-        self.message_id = message_id
-        self.chat_id = chat_id
+    def __init__(self, client: Any, card_id: str):
+        self.client = client
+        self.card_id = card_id
         self.trace: list[str] = []
         self.answer = ""
         self.failed = False
@@ -221,6 +242,10 @@ class CardReply:
         self._pending_tools: dict[str, list[float]] = {}
         self._task: asyncio.Task | None = None
         self._stopping = asyncio.Event()
+        self._seq = 0
+        # 推送帧的成败计数，收尾时打进日志（用来验证会不会撞上飞书的频率限制）
+        self.frames_ok = 0
+        self.frames_failed = 0
 
     def on_tool_start(self, name: str, args: dict) -> None:
         self._pending_tools.setdefault(name, []).append(time.monotonic())
@@ -248,30 +273,54 @@ class CardReply:
         hidden = len(self.trace) - (MAX_TRACE_LINES - 1)
         return [*self.trace[: MAX_TRACE_LINES - 1], f"… 另有 {hidden} 条工具记录"]
 
-    def _subtitle(self, final: bool) -> str:
-        """卡片副标题：跑的时候给状态，结束时给个小结。"""
-        if not final:
-            return "正在分析…"
+    def _footer(self) -> str:
+        """收尾状态行。放在正文里而不是卡片副标题：副标题属于卡片头，改它要整卡更新。"""
+        secs = time.monotonic() - self.started
         if self.failed:
-            return "出错了"
-        steps = f" · {len(self.trace)} 步工具调用" if self.trace else ""
-        return f"完成{steps} · {time.monotonic() - self.started:.1f}s"
+            return f"> ⏱ {secs:.1f}s ｜ 本轮出错了"
+        steps = f" ｜ {len(self.trace)} 步工具调用" if self.trace else ""
+        return f"> ✅ 完成{steps} ｜ 耗时 {secs:.1f}s"
 
-    def _card(self, final: bool) -> dict:
-        return build_card(
-            self._trace_text(),
-            self.answer,
-            subtitle=self._subtitle(final),
-            template="red" if self.failed else "blue",
-        )
+    def render(self, final: bool = False) -> str:
+        """
+        把"工具轨迹 + 回答 (+ 状态行)"合成流式元素要的那段完整 Markdown。
+
+        轨迹写成无序列表的一行一项：单个 markdown 组件里裸 \\n 属于软换行，渲染时
+        可能被忽略，只有列表项或空行才保证分行——这是卡片 2.0 实测出来的行为。
+        """
+        blocks: list[str] = []
+        if self.trace:
+            blocks.append("\n".join(f"- {line}" for line in self._trace_text()))
+        blocks.append(self.answer.strip() or "🔍 正在分析，请稍候…")
+        if final:
+            blocks.append(self._footer())
+        return "\n\n".join(blocks)
+
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
 
     def _snapshot_sig(self) -> tuple[int, int, bool]:
         """内容指纹。用长度当指纹足够：回答只增不减，工具轨迹只追加。"""
         return len(self.answer), len(self.trace), self.failed
 
-    async def _patcher(self, client: Any) -> None:
+    async def _push(self, final: bool) -> None:
+        """推一帧。任何异常都只算丢一帧——不能让后台协程因此死掉。"""
+        try:
+            ok = await asyncio.to_thread(
+                _stream_element, self.client, self.card_id, self.render(final), self._next_seq()
+            )
+        except Exception as exc:  # noqa: BLE001 - 推送失败不该中断本轮回答
+            _log(f"[WARN] 流式推送异常：{type(exc).__name__}: {exc}")
+            ok = False
+        if ok:
+            self.frames_ok += 1
+        else:
+            self.frames_failed += 1
+
+    async def _patcher(self) -> None:
         """
-        后台刷新循环：每隔 PATCH_INTERVAL 看一眼最新快照，有变化就推一次。
+        后台推送循环：每隔 STREAM_INTERVAL 看一眼最新快照，有变化就推一次全量文本。
 
         它睡多久都不会拖慢模型输出的消费，所以帧间距是稳定的。
         """
@@ -279,26 +328,26 @@ class CardReply:
         while not self._stopping.is_set():
             with contextlib.suppress(asyncio.TimeoutError):
                 # 用"等停止事件"代替纯 sleep：收尾时能立刻醒来退出，不必白等满一帧
-                await asyncio.wait_for(self._stopping.wait(), timeout=PATCH_INTERVAL)
+                await asyncio.wait_for(self._stopping.wait(), timeout=STREAM_INTERVAL)
             if self._stopping.is_set():
                 break
             sig = self._snapshot_sig()
             if sig == seen:
                 continue  # 内容没变（比如正在等工具返回），不白烧飞书的更新额度
             seen = sig
-            await _patch_card(client, self.message_id, self._card(final=False), quiet=True)
+            await self._push(final=False)
 
-    def start(self, client: Any) -> None:
-        """启动后台刷新协程。"""
-        self._task = asyncio.create_task(self._patcher(client))
+    def start(self) -> None:
+        """启动后台推送协程。"""
+        self._task = asyncio.create_task(self._patcher())
 
     async def stop(self) -> None:
         """
-        停止后台刷新。
+        停止后台推送。
 
-        这里要 await 到协程真正退出，而不是 cancel：取消会在 to_thread 里外抛
-        CancelledError，而那个已经在跑的 PATCH 线程并不会停，可能晚于 flush()
-        才落地、把最终回答盖回一份旧快照。等它跑完这一帧再退就没这个问题。
+        这里要 await 到协程真正退出，而不是 cancel：取消只是在 to_thread 外面抛
+        CancelledError，那个已经在跑的请求线程并不会停，可能晚于最终内容才落地、
+        把回答盖回一份旧快照。等它跑完这一帧再退就没这个问题。
         """
         if self._task is None:
             return
@@ -307,9 +356,13 @@ class CardReply:
             await self._task
         self._task = None
 
-    async def flush(self, client: Any) -> None:
-        """强制刷新（最终回答）。"""
-        await _patch_card(client, self.message_id, self._card(final=True), quiet=False)
+    async def finish(self) -> None:
+        """推最终文本，然后关掉流式模式（不关的话打字光标会一直转）。"""
+        await self._push(final=True)
+        try:
+            await asyncio.to_thread(_close_streaming, self.client, self.card_id, self._next_seq())
+        except Exception as exc:  # noqa: BLE001 - 关流式失败只是光标停不下来，别影响本轮回答
+            _log(f"[WARN] 关闭流式异常：{type(exc).__name__}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +375,7 @@ def _api_error(response: Any) -> str:
 
 
 def _reply_card(client: Any, message_id: str, card: dict) -> str | None:
-    """回复一张卡片，返回新消息的 message_id（后续 PATCH 要用）。"""
+    """回复一张**内联 JSON** 卡片（不参与流式的两条快速回复用这条路）。"""
     from lark_oapi.api.im.v1.model.reply_message_request import ReplyMessageRequest
     from lark_oapi.api.im.v1.model.reply_message_request_body import ReplyMessageRequestBody
 
@@ -344,32 +397,98 @@ def _reply_card(client: Any, message_id: str, card: dict) -> str | None:
     return response.data.message_id
 
 
-def _patch_card_sync(client: Any, message_id: str, card: dict, quiet: bool) -> None:
-    from lark_oapi.api.im.v1.model.patch_message_request import PatchMessageRequest
-    from lark_oapi.api.im.v1.model.patch_message_request_body import PatchMessageRequestBody
+def _create_card(client: Any, card: dict) -> str | None:
+    """创建卡片实体，返回 card_id。流式更新是按实体定位的，所以必须先建它。"""
+    from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
 
     request = (
-        PatchMessageRequest.builder()
-        .message_id(message_id)
+        CreateCardRequest.builder()
         .request_body(
-            PatchMessageRequestBody.builder()
-            .content(json.dumps(card, ensure_ascii=False))
+            CreateCardRequestBody.builder()
+            .type("card_json")
+            .data(json.dumps(card, ensure_ascii=False))
             .build()
         )
         .build()
     )
-    response = client.im.v1.message.patch(request)
-    if not response.success() and not quiet:
-        _log(f"[ERROR] 更新卡片失败：{_api_error(response)}")
+    response = client.cardkit.v1.card.create(request)
+    if not response.success():
+        _log(f"[ERROR] 创建卡片实体失败：{_api_error(response)}")
+        return None
+    return response.data.card_id
 
 
-async def _patch_card(client: Any, message_id: str, card: dict, quiet: bool) -> None:
-    # 同步 SDK + 网络请求，必须丢线程，否则会卡住整个 Agent 事件循环
-    try:
-        await asyncio.to_thread(_patch_card_sync, client, message_id, card, quiet)
-    except Exception as exc:  # noqa: BLE001 - 刷新卡片失败不该中断本轮回答
-        if not quiet:
-            _log(f"[WARN] 更新卡片异常：{type(exc).__name__}: {exc}")
+def _reply_card_entity(client: Any, message_id: str, card_id: str) -> str | None:
+    """用 card_id 回复一条卡片消息（content 形状是探针实测出来的唯一可用写法）。"""
+    from lark_oapi.api.im.v1.model.reply_message_request import ReplyMessageRequest
+    from lark_oapi.api.im.v1.model.reply_message_request_body import ReplyMessageRequestBody
+
+    request = (
+        ReplyMessageRequest.builder()
+        .message_id(message_id)
+        .request_body(
+            ReplyMessageRequestBody.builder()
+            .content(json.dumps({"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False))
+            .msg_type("interactive")
+            .build()
+        )
+        .build()
+    )
+    response = client.im.v1.message.reply(request)
+    if not response.success():
+        _log(f"[ERROR] 回复卡片消息失败：{_api_error(response)}")
+        return None
+    return response.data.message_id
+
+
+def _stream_element(client: Any, card_id: str, text: str, sequence: int) -> bool:
+    """
+    往流式元素推一次**全量文本**。
+
+    content 是累计完整文本而不是增量，增量由飞书计算；sequence 必须严格递增，
+    失败只当丢一帧（调用方计数），不中断本轮回答。
+    """
+    import uuid
+
+    from lark_oapi.api.cardkit.v1 import ContentCardElementRequest, ContentCardElementRequestBody
+
+    request = (
+        ContentCardElementRequest.builder()
+        .card_id(card_id)
+        .element_id(STREAM_ELEMENT_ID)
+        .request_body(
+            ContentCardElementRequestBody.builder()
+            .content(text)
+            .sequence(sequence)
+            .uuid(str(uuid.uuid4()))
+            .build()
+        )
+        .build()
+    )
+    return client.cardkit.v1.card_element.content(request).success()
+
+
+def _close_streaming(client: Any, card_id: str, sequence: int) -> None:
+    """关掉 streaming_mode。不调这一步，卡片会一直挂着"生成中"的打字光标。"""
+    import uuid
+
+    from lark_oapi.api.cardkit.v1 import SettingsCardRequest, SettingsCardRequestBody
+
+    request = (
+        SettingsCardRequest.builder()
+        .card_id(card_id)
+        .request_body(
+            SettingsCardRequestBody.builder()
+            .settings(json.dumps({"streaming_mode": False}))
+            .sequence(sequence)
+            .uuid(str(uuid.uuid4()))
+            .build()
+        )
+        .build()
+    )
+    response = client.cardkit.v1.card.settings(request)
+    if not response.success():
+        _log(f"[WARN] 关闭流式模式失败：{_api_error(response)}")
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +507,8 @@ async def process_message(bot: K8sAgent, client: Any, data: Any) -> None:
     if message.message_type != "text":
         body = "目前只认文字提问，图片/文件/语音还不会看。"
         await asyncio.to_thread(
-            _reply_card, client, message.message_id, build_card([], body, subtitle="暂不支持")
+            _reply_card, client, message.message_id,
+            build_card(body, subtitle="暂不支持", streaming=False),
         )
         return
 
@@ -408,22 +528,25 @@ async def process_message(bot: K8sAgent, client: Any, data: Any) -> None:
         bot.reset_memory(thread_id)
         await asyncio.to_thread(
             _reply_card, client, message.message_id,
-            build_card([], "已清空本会话的对话历史。", subtitle="已重置"),
+            build_card("已清空本会话的对话历史。", subtitle="已重置", streaming=False),
         )
         return
 
-    reply_message_id = await asyncio.to_thread(
-        _reply_card, client, message.message_id, build_card([], "", subtitle="正在分析…")
+    # 流式卡片的两步前置：先建卡片实体拿 card_id，再用 card_id 回复消息
+    card_id = await asyncio.to_thread(
+        _create_card, client, build_card("", subtitle="正在分析…")
     )
-    if reply_message_id is None:
+    if card_id is None:
+        return
+    if await asyncio.to_thread(_reply_card_entity, client, message.message_id, card_id) is None:
         return
 
-    reply = CardReply(reply_message_id, chat_id)
-    reply.start(client)
+    reply = CardReply(client, card_id)
+    reply.start()
 
     try:
-        # 这个循环里刻意不做任何网络 await：卡片交给 reply 的后台协程去刷。
-        # 只要在这里 await 一次 PATCH，token 流就会被它的往返时间切断一次
+        # 这个循环里刻意不做任何网络 await：卡片交给 reply 的后台协程去推。
+        # 只要在这里 await 一次更新，token 流就会被它的往返时间切断一次
         async for event in bot.astream(question, thread_id=thread_id):
             if event.kind == "tool_start":
                 reply.on_tool_start(event.tool_name, event.tool_args)
@@ -436,12 +559,16 @@ async def process_message(bot: K8sAgent, client: Any, data: Any) -> None:
         reply.failed = True
         reply.answer = reply.answer or f"处理这条消息出错了：`{type(exc).__name__}: {exc}`"
 
-    # 先停后台刷新，再推最终内容——顺序反了会有一帧旧快照抢在后面盖掉回答
+    # 先停后台推送，再发最终内容——顺序反了会有一帧旧快照抢在后面盖掉回答
     await reply.stop()
     if not reply.answer.strip():
         reply.answer = "_（本轮没有文字回答）_"
-    await reply.flush(client)
-    _log(f"已回复（{len(reply.trace)} 条工具记录，{len(reply.answer)} 字）")
+    await reply.finish()
+    _log(
+        f"已回复（{len(reply.trace)} 条工具记录，{len(reply.answer)} 字）"
+        f" | 流式推送 {reply.frames_ok} 帧成功"
+        + (f"，{reply.frames_failed} 帧失败" if reply.frames_failed else "，无丢帧")
+    )
 
 
 def make_handler(bot: K8sAgent, client: Any, agent_loop: asyncio.AbstractEventLoop):
