@@ -33,5 +33,10 @@ langchain-tavily
 rich
 python-dotenv
 
+# YAML parsing/serializing in agent.py: the `resource list` payload comes back as YAML
+# and is projected down to an ops view before reaching the model. It was already present
+# as a transitive dependency, but we import it directly so it must be declared.
+PyYAML
+
 # Feishu bot (stage 6). Feishu official SDK
 lark-oapi

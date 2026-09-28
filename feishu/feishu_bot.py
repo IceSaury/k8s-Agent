@@ -34,6 +34,10 @@ lark-oapi 提供的 WebSocket 长连接模式由客户端主动连飞书，不�
 一轮问答只占用一条飞书消息：先 reply 一张「正在分析…」卡片拿到 message_id，
 之后工具调用与流式回答都用 PATCH 刷新同一张卡片，避免刷屏。
 
+刷新由 CardReply 的**后台协程**按 PATCH_INTERVAL 的节奏做，不在消费 token 的循环里
+await。原因见 CardReply 的文档字符串：PATCH 是一次真实 HTTPS 往返，写在 token 循环里
+会把流打断成"冻结 -> 蹦一大块"，这正是之前流式输出卡顿的来源。
+
 卡片用 **卡片 JSON 2.0** 结构（见 build_card）：2.0 的 markdown 组件支持全部标准
 Markdown，LLM 的回答可以原样贴进去。注意 2.0 的卡片必须是共享卡片
 （config.update_multi 只能为 true），只有共享卡片才允许被 PATCH 更新。
@@ -47,6 +51,7 @@ Markdown，LLM 的回答可以原样贴进去。注意 2.0 的卡片必须是共
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import threading
 import time
@@ -62,8 +67,9 @@ from config import settings  # noqa: E402
 # 卡片里最多显示多少行工具轨迹，超出的折叠成一行汇总
 MAX_TRACE_LINES = 12
 
-# 流式刷新卡片的最小间隔（秒）。飞书对消息更新有频率限制，刷太快会被限流
-PATCH_INTERVAL = 1.2
+# 后台刷新卡片的时间闸（秒）。飞书对消息更新有频率限制，刷太快会被限流；
+# 但被限流只是丢一帧（流式 PATCH 走 quiet=True，失败不影响回答），所以下限取 0.4
+PATCH_INTERVAL = 0.4
 
 # 单条提问最多取多少字符，防止有人粘贴一整篇日志把上下文撑爆
 MAX_INPUT_CHARS = 1000
@@ -196,8 +202,13 @@ class CardReply:
     """
     挂在一条飞书卡片消息上的回复器。
 
-    工具调用与回答片段都先更新到内存状态，再由 flush() 用一次 PATCH 推到飞书。
-    流式回答靠 maybe_flush() 节流，最终结果由 flush() 强制推送。
+    工具调用与回答片段都只更新到内存状态，卡片由一个后台协程按 PATCH_INTERVAL
+    取"当前最新快照"推出去。最终结果由 flush() 强制推送。
+
+    为什么刷新不能写在 token 循环里：PATCH 是一次真实的 HTTPS 往返（约 0.2~0.5s），
+    在 `async for event in bot.astream(...)` 里 await 它，这段时间 token 循环是挂起的、
+    消费不了模型输出，token 只能堆在缓冲区等请求回来一次性吐出——回答就变成
+    "冻结一秒多 -> 蹦出一大块字"。所以这里把网络彻底挪出主循环，token 侧只做内存累加。
     """
 
     def __init__(self, message_id: str, chat_id: str):
@@ -207,8 +218,9 @@ class CardReply:
         self.answer = ""
         self.failed = False
         self.started = time.monotonic()
-        self._last_patch = 0.0
         self._pending_tools: dict[str, list[float]] = {}
+        self._task: asyncio.Task | None = None
+        self._stopping = asyncio.Event()
 
     def on_tool_start(self, name: str, args: dict) -> None:
         self._pending_tools.setdefault(name, []).append(time.monotonic())
@@ -253,17 +265,50 @@ class CardReply:
             template="red" if self.failed else "blue",
         )
 
-    async def maybe_flush(self, client: Any) -> None:
-        """流式期间按 PATCH_INTERVAL 节流刷新。"""
-        now = time.monotonic()
-        if now - self._last_patch < PATCH_INTERVAL:
+    def _snapshot_sig(self) -> tuple[int, int, bool]:
+        """内容指纹。用长度当指纹足够：回答只增不减，工具轨迹只追加。"""
+        return len(self.answer), len(self.trace), self.failed
+
+    async def _patcher(self, client: Any) -> None:
+        """
+        后台刷新循环：每隔 PATCH_INTERVAL 看一眼最新快照，有变化就推一次。
+
+        它睡多久都不会拖慢模型输出的消费，所以帧间距是稳定的。
+        """
+        seen: tuple[int, int, bool] | None = None
+        while not self._stopping.is_set():
+            with contextlib.suppress(asyncio.TimeoutError):
+                # 用"等停止事件"代替纯 sleep：收尾时能立刻醒来退出，不必白等满一帧
+                await asyncio.wait_for(self._stopping.wait(), timeout=PATCH_INTERVAL)
+            if self._stopping.is_set():
+                break
+            sig = self._snapshot_sig()
+            if sig == seen:
+                continue  # 内容没变（比如正在等工具返回），不白烧飞书的更新额度
+            seen = sig
+            await _patch_card(client, self.message_id, self._card(final=False), quiet=True)
+
+    def start(self, client: Any) -> None:
+        """启动后台刷新协程。"""
+        self._task = asyncio.create_task(self._patcher(client))
+
+    async def stop(self) -> None:
+        """
+        停止后台刷新。
+
+        这里要 await 到协程真正退出，而不是 cancel：取消会在 to_thread 里外抛
+        CancelledError，而那个已经在跑的 PATCH 线程并不会停，可能晚于 flush()
+        才落地、把最终回答盖回一份旧快照。等它跑完这一帧再退就没这个问题。
+        """
+        if self._task is None:
             return
-        self._last_patch = now
-        await _patch_card(client, self.message_id, self._card(final=False), quiet=True)
+        self._stopping.set()
+        with contextlib.suppress(Exception):
+            await self._task
+        self._task = None
 
     async def flush(self, client: Any) -> None:
         """强制刷新（最终回答）。"""
-        self._last_patch = time.monotonic()
         await _patch_card(client, self.message_id, self._card(final=True), quiet=False)
 
 
@@ -374,23 +419,25 @@ async def process_message(bot: K8sAgent, client: Any, data: Any) -> None:
         return
 
     reply = CardReply(reply_message_id, chat_id)
+    reply.start(client)
 
     try:
+        # 这个循环里刻意不做任何网络 await：卡片交给 reply 的后台协程去刷。
+        # 只要在这里 await 一次 PATCH，token 流就会被它的往返时间切断一次
         async for event in bot.astream(question, thread_id=thread_id):
             if event.kind == "tool_start":
                 reply.on_tool_start(event.tool_name, event.tool_args)
-                await reply.maybe_flush(client)
             elif event.kind == "tool_end":
                 reply.on_tool_end(event.tool_name, event.ok)
-                await reply.maybe_flush(client)
             elif event.kind == "token":
                 reply.answer += event.text
-                await reply.maybe_flush(client)
     except Exception as exc:  # noqa: BLE001 - 单条消息失败不能让机器人退出
         _log(f"[ERROR] 处理提问失败：{type(exc).__name__}: {exc}")
         reply.failed = True
         reply.answer = reply.answer or f"处理这条消息出错了：`{type(exc).__name__}: {exc}`"
 
+    # 先停后台刷新，再推最终内容——顺序反了会有一帧旧快照抢在后面盖掉回答
+    await reply.stop()
     if not reply.answer.strip():
         reply.answer = "_（本轮没有文字回答）_"
     await reply.flush(client)

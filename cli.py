@@ -39,8 +39,10 @@ from rich.text import Text  # noqa: E402
 from agent import DEFAULT_THREAD_ID, K8sAgent  # noqa: E402
 from config import settings  # noqa: E402
 
-# 流式渲染的最小刷新间隔（秒）。qwen-plus 出字很快，逐 token 重排 Markdown 会拖慢终端
-_RENDER_INTERVAL = 0.08
+# 流式渲染的最小刷新间隔（秒）。_answer_panel 每帧都要把全量已生成文本重新解析一遍
+# Markdown，是 O(n) 的：回答到三四千字时单帧渲染会逼近 80ms，间隔太密反而让终端卡。
+# 120ms（约 8fps）肉眼仍是连续的，且给整块重解析留了余量
+_RENDER_INTERVAL = 0.12
 
 # 工具参数显示的截断长度，太长会把终端刷满
 _ARGS_LIMIT = 80
@@ -165,13 +167,15 @@ async def run_turn(bot: K8sAgent, user_input: str) -> None:
                     live = Live(
                         _answer_panel(buffer),
                         console=console,
-                        refresh_per_second=12,
+                        # 关掉自动刷新线程：渲染节奏由上面的 _RENDER_INTERVAL 掌控，
+                        # 让 rich 自己按帧率重画只是把同一份 Markdown 多解析几遍
+                        auto_refresh=False,
                         vertical_overflow="visible",
                     )
                     live.start()
                     last_render = now
                 elif live is not None and now - last_render >= _RENDER_INTERVAL:
-                    live.update(_answer_panel(buffer))
+                    live.update(_answer_panel(buffer), refresh=True)
                     last_render = now
 
             # kind == "done" 无需处理，循环结束统一收尾
@@ -179,7 +183,7 @@ async def run_turn(bot: K8sAgent, user_input: str) -> None:
     finally:
         if live is not None:
             # 补最后一帧（中断时也能看到已生成的部分），stop() 会把这一帧留在终端上
-            live.update(_answer_panel(buffer))
+            live.update(_answer_panel(buffer), refresh=True)
             live.stop()
 
     # 没开 Live 的场合（重定向到文件、非常规终端）在这里一次性打印，开了的不能再打一遍

@@ -69,6 +69,7 @@ class Settings:
     mcp_timeout: int = 10
     allow_mcp_fallback: bool = True
     tool_call_timeout: int = 30
+    trim_tool_payload: bool = True
 
     # --- 搜索工具 ---
     search_provider: str = "duckduckgo"
@@ -136,6 +137,7 @@ def load_settings() -> Settings:
         mcp_timeout=_get_int("K8S_MCP_TIMEOUT", 10),
         allow_mcp_fallback=_get_bool("ALLOW_MCP_FALLBACK", True),
         tool_call_timeout=_get_int("TOOL_CALL_TIMEOUT", 30),
+        trim_tool_payload=_get_bool("TRIM_TOOL_PAYLOAD", True),
         search_provider=search_provider,
         search_max_results=_get_int("SEARCH_MAX_RESULTS", 5),
         search_proxy=_get("SEARCH_PROXY"),
@@ -179,6 +181,7 @@ if __name__ == "__main__":
         ("K8S_MCP_TIMEOUT", str(settings.mcp_timeout)),
         ("ALLOW_MCP_FALLBACK", str(settings.allow_mcp_fallback)),
         ("TOOL_CALL_TIMEOUT", str(settings.tool_call_timeout)),
+        ("TRIM_TOOL_PAYLOAD", str(settings.trim_tool_payload)),
         ("MEMORY_WINDOW_ROUNDS", str(settings.memory_window_rounds)),
         ("SEARCH_PROVIDER", settings.search_provider),
         ("SEARCH_MAX_RESULTS", str(settings.search_max_results)),

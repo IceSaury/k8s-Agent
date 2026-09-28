@@ -19,6 +19,9 @@ Agent 核心模块：接载 MCP 工具、组装 Agent、提供带记忆的流式
     调用 Server 时适配器内部仍用原始名，不受影响（见 langchain_mcp_adapters/tools.py）。
   - 原始名保存在 tool.metadata["mcp_name"]，供 CLI 按 PDF 的样式展示。
 
+工具返回值还要再过一道"瘦身"（_trim_list_result）：resource list 一次列全量 Pod 的原始
+YAML 有 135KB，每次模型调用都得重读一遍，是回答越来越慢的主因，所以投影成运维视图再给模型。
+
 虚拟机没开机时，MCP Server 不可达。此时若 ALLOW_MCP_FALLBACK=true 就回退到
 tools/mock_k8s.py 的离线工具，保证 Agent 主逻辑仍可开发和演示。
 """
@@ -31,6 +34,7 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import yaml
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
@@ -88,13 +92,213 @@ def _fix_namespace_args(tool_name: str, kwargs: dict) -> dict:
     return kwargs
 
 
+# ---------------------------------------------------------------------------
+# 工具结果瘦身：resource list 的原始 YAML 太大
+#
+# 真机实测（2026-09-28，22 个 Pod）：一次 `resource list` 列 Pod 返回 135.2KB YAML。
+# 体积不是被某个"垃圾字段"吃掉的——managedFields 服务端已经剥掉了，annotations 只占
+# 4.5KB——而是平摊在 spec(31KB) / status(31KB) / metadata(16KB) 上。真正对运维问答没用
+# 的噪音是 spec.volumes+projected(14.8KB)、spec.tolerations(4.9KB)、volumeMounts(2.5KB)、
+# imageID(2.4KB)；Node 那边 status.images 一项就占 12.9KB（Node 总共才 20.3KB）。
+#
+# 按下表投影后：Pod 135.2KB -> 18.3KB，Node 20.3KB -> 4.4KB，而 restartCount、
+# lastState.reason、conditions、nodeName、image、requests/limits 这些真正用来答题的
+# 字段一个没丢。
+#
+# 只裁 resource list —— 它是唯一会整片返回几十个对象的工具。resource describe / get
+# 的语义就是"我要这个对象的完整定义"，裁掉等于把用户要查的东西裁掉，不动。
+# ---------------------------------------------------------------------------
+
+# 容器状态里这串 70 字符的 docker sha 对答题没有任何用处
+_STATE_NOISE_KEYS = {"containerID"}
+
+
+def _strip_state(block: Any) -> dict:
+    """
+    清理 state / lastState。
+
+    它们的形状是 {"terminated": {...}} / {"running": {...}}，要丢的 containerID 藏在
+    里层那一块，所以外层内层都过滤一遍。其余（reason、exitCode、时间）原样保留。
+    """
+    if not isinstance(block, dict):
+        return {}
+    cleaned: dict = {}
+    for outer_key, outer_value in block.items():
+        if outer_key in _STATE_NOISE_KEYS:
+            continue
+        if isinstance(outer_value, dict):
+            outer_value = {
+                k: v for k, v in outer_value.items() if k not in _STATE_NOISE_KEYS
+            }
+        cleaned[outer_key] = outer_value
+    return cleaned
+
+
+def _project_pod(item: dict) -> dict:
+    """Pod 的运维视图：在哪台节点、什么状态、容器在不在跑、重启过几次、为什么重启。"""
+    meta = item.get("metadata") or {}
+    spec = item.get("spec") or {}
+    status = item.get("status") or {}
+    return {
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "labels": meta.get("labels"),
+        "nodeName": spec.get("nodeName"),
+        "phase": status.get("phase"),
+        "podIP": status.get("podIP"),
+        "hostIP": status.get("hostIP"),
+        "containers": [
+            {"name": c.get("name"), "image": c.get("image"), "resources": c.get("resources")}
+            for c in (spec.get("containers") or [])
+        ],
+        # conditions 全是 True 是常态，逐条列出来纯属占体积；只保留非 True 的异常项。
+        # 空列表就是"各项条件都正常"，这一点在 _TRIM_NOTE 里跟模型讲清楚
+        "abnormalConditions": [
+            {
+                "type": c.get("type"),
+                "status": c.get("status"),
+                "reason": c.get("reason"),
+                "message": c.get("message"),
+            }
+            for c in (status.get("conditions") or [])
+            if c.get("status") != "True"
+        ],
+        "containerStatuses": [
+            {
+                "name": c.get("name"),
+                "ready": c.get("ready"),
+                "restartCount": c.get("restartCount"),
+                "state": _strip_state(c.get("state")),
+                "lastState": _strip_state(c.get("lastState")),
+            }
+            for c in (status.get("containerStatuses") or [])
+        ],
+    }
+
+
+def _project_node(item: dict) -> dict:
+    """Node 的运维视图：地址、容量、可分配、状态条件、版本信息。"""
+    meta = item.get("metadata") or {}
+    spec = item.get("spec") or {}
+    status = item.get("status") or {}
+    return {
+        "name": meta.get("name"),
+        "labels": meta.get("labels"),
+        "unschedulable": spec.get("unschedulable"),
+        "taints": spec.get("taints"),
+        "addresses": status.get("addresses"),
+        "capacity": status.get("capacity"),
+        "allocatable": status.get("allocatable"),
+        "conditions": [
+            {"type": c.get("type"), "status": c.get("status"), "reason": c.get("reason")}
+            for c in (status.get("conditions") or [])
+        ],
+        "nodeInfo": status.get("nodeInfo"),
+        # 镜像清单是 Node 结果的体积大头，压成一个数量。真需要看镜像列表时模型会去
+        # 调别的工具或 describe 单个节点，而不是每次列节点都拖着 13KB 镜像名
+        "imageCount": len(status.get("images") or []),
+    }
+
+
+_PROJECTORS = {"Pod": _project_pod, "Node": _project_node}
+
+# 精简之后必须告诉模型"哪些字段没了"，否则它会以为集群里真的没有探针/挂载配置，
+# 或者干脆凭猜测补细节（这类坑前面踩过）
+_TRIM_NOTE = (
+    "\n[说明：以上是 resource list 的运维视图，已精简掉 volumes/tolerations/探针/环境变量/"
+    "serviceAccount 等字段；abnormalConditions 只列出非 True 的条件，空列表表示各项条件均正常；"
+    "Node 的镜像列表只保留了数量。需要某个对象的完整定义时，对它单独调用 "
+    "resource describe 或 resource get，不要凭猜测补细节。]"
+)
+
+
+def _unwrap(result: Any) -> Any:
+    """
+    剥掉外层容器，拿到真正的内容块。
+
+    坑：我们的包装层罩在 MCP 适配器的 coroutine 外面，而这套工具是
+    `response_format="content_and_artifact"`，所以 coroutine 返回的是
+    `(内容块列表, artifact)` **二元组**，不是内容块本身；要等 `StructuredTool._arun`
+    在我们返回之后才把它转成 ToolMessage 的 content。只按 list/dict 判断会什么都
+    取不到，于是瘦身每次提前返回、静默失效（真机踩过：ainvoke 拿到 138KB 原文）。
+    """
+    if isinstance(result, tuple) and len(result) == 2:
+        result = result[0]
+    # CallToolResult 之类的容器：内容块挂在 .content 上
+    return getattr(result, "content", result)
+
+
+def _result_text(result: Any) -> str:
+    """从工具返回值里取出纯文本。认三种形状：裸字符串、字典块、带 .text 的内容对象。"""
+    blocks = _unwrap(result)
+    if isinstance(blocks, str):
+        return blocks
+    if not isinstance(blocks, (list, tuple)):
+        return ""
+
+    parts: list[str] = []
+    for block in blocks:
+        if isinstance(block, dict):
+            if block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        elif getattr(block, "type", None) == "text" and getattr(block, "text", None) is not None:
+            parts.append(str(block.text))
+    return "".join(parts)
+
+
+def _rebuild_text(result: Any, new_text: str) -> Any:
+    """把精简后的文本塞回原来的返回形状，不破坏 content_and_artifact 期望的结构。"""
+    blocks = _unwrap(result)
+    content: Any = [{"type": "text", "text": new_text}] if isinstance(blocks, list) else new_text
+    if isinstance(result, tuple) and len(result) == 2:
+        return (content, result[1])
+    return content
+
+
+def _trim_list_result(result: Any) -> Any:
+    """
+    把 resource list 的 YAML 投影成运维视图。
+
+    任何"形状不对"的情况都原样返回：不是文本、解析不出 YAML、不是对象列表、kind 没有
+    对应投影器、序列化失败。瘦身是优化，绝不能把工具调用本身搞坏。
+    """
+    if not settings.trim_tool_payload:
+        return result
+    text = _result_text(result)
+    if not text:
+        return result
+    try:
+        doc = yaml.safe_load(text)
+    except Exception:  # noqa: BLE001 - 多半是错误信息而非 YAML，退回原文
+        return result
+    if not isinstance(doc, list) or not doc or not all(isinstance(i, dict) for i in doc):
+        return result
+
+    projector = _PROJECTORS.get(str(doc[0].get("kind") or ""))
+    if projector is None:
+        return result
+    try:
+        body = yaml.safe_dump(
+            [projector(item) for item in doc],
+            allow_unicode=True,
+            sort_keys=False,
+            default_flow_style=False,
+        )
+    except Exception:  # noqa: BLE001 - 投影本身出错时同样退回原文
+        return result
+
+    saved = (len(text) - len(body)) / len(text) * 100
+    print(f"  [TRIM] resource list 结果 {len(text)/1024:.1f}KB -> {len(body)/1024:.1f}KB（省 {saved:.0f}%）")
+    return _rebuild_text(result, body + _TRIM_NOTE)
+
+
 def _harden_tool(tool: BaseTool) -> None:
     """
-    给工具包一层"入参兜底 + 调用超时"。
+    给工具包三层："入参兜底 + 调用超时 + 结果瘦身"。
 
     包装点在 tool.coroutine（StructuredTool 的异步实现），调用链是：
         ToolNode -> tool.ainvoke -> StructuredTool._arun -> self.coroutine(**args)
-    在这里既能拿到 LLM 传进来的参数，又能把整个网络调用罩住。
+    在这里既能拿到 LLM 传进来的参数，又能把整个网络调用罩住，还能改它返回给模型的内容。
 
     只有异步工具（MCP 工具）才有 coroutine；本地的 web_search 与 mock 工具是同步函数，
     这里会直接跳过——它们本来就有自己的超时，也不会挂死。
@@ -106,7 +310,7 @@ def _harden_tool(tool: BaseTool) -> None:
     async def hardened(*args: Any, **kwargs: Any) -> Any:
         args_fixed = _fix_namespace_args(tool.name, kwargs)
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 original(*args, **args_fixed), timeout=settings.tool_call_timeout
             )
         except asyncio.TimeoutError as exc:
@@ -117,11 +321,15 @@ def _harden_tool(tool: BaseTool) -> None:
                 "已中止本次调用。可能是该工具对当前入参不响应，请换用其他工具或换个参数重试。"
             ) from exc
 
+        if tool.name == "resource_list":
+            return _trim_list_result(result)
+        return result
+
     tool.coroutine = hardened
 
 
 def _prepare_tools(raw_tools: list[BaseTool]) -> list[BaseTool]:
-    """工具统一后处理：净化工具名、把原始名记进 metadata、并做加固（兜底 + 超时）。"""
+    """工具统一后处理：净化工具名、把原始名记进 metadata、并做加固（兜底 + 超时 + 瘦身）。"""
     for tool in raw_tools:
         original = tool.metadata.get("mcp_name") if tool.metadata else None
         if original is None:

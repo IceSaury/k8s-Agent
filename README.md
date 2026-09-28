@@ -98,6 +98,10 @@ You: 查看集群有哪些 node 节点
 
 - 回答用 `rich.Live` + `Panel(Markdown(...))` 流式刷新。工具调用发生在回答生成之前，
   那时 `console.print` 会把内容推到 Live 面板**上方**，不会打断正在刷新的面板。
+- 刷新节奏由 `_RENDER_INTERVAL`（120ms）自己控制，所以 `Live(auto_refresh=False)` 关掉了 rich
+  的自动刷新线程——否则那个线程会按自己的帧率把**同一份 Markdown** 多解析几遍。之所以不用更密的
+  80ms：`_answer_panel` 每帧都要把"目前为止的全部文本"重新解析一遍 Markdown，这是 O(n) 的，
+  回答到三四千字时单帧渲染就逼近 80ms，间隔太密反而让终端看起来一卡一卡的。
 - 非终端环境（`python cli.py > log.txt`、管道输入）自动关闭 Live，改为结束后一次性打印，
   否则 Live 的反复整屏重画会把日志刷爆。
 - 启动时执行 `console_boot.bootstrap_console()`：Windows 控制台默认 GBK 代码页，`✅`/`🔧`/`🤖`
@@ -135,9 +139,28 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
 ```
 用户发问
   └─ reply 一张「正在分析…」卡片  ──> 拿到 message_id
-         └─ 之后工具轨迹 / 流式回答都用 PATCH 刷新这条消息（节流 1.2s）
-                └─ 结束后再 PATCH 一次最终卡片（副标题变成「完成 · N 步工具调用 · X.Xs」）
+         └─ 后台协程每 0.4s 取一次最新快照 PATCH 这条消息（工具轨迹 / 流式回答都在里面）
+                └─ 结束后停掉后台协程，再 PATCH 一次最终卡片（副标题变成「完成 · N 步工具调用 · X.Xs」）
 ```
+
+**刷新为什么必须放在后台协程里，而不是写在 token 循环里。** 早先的写法是每来一个 token 就
+`await maybe_flush()`，看起来只是"节流"，实际上 PATCH 是一次真实的 HTTPS 往返（约 0.2~0.5s），
+而这段 await 发生在 `async for event in bot.astream(...)` 里面——**这段时间 token 循环是挂起的，
+消费不了模型输出**，只能堆在缓冲区等请求回来一次性吐出。观感就是"冻结一秒多 → 蹦出一大块字"。
+
+用假客户端（每次 PATCH 固定 0.25s 往返）灌 3 秒的 token 流做对照：
+
+| 写法 | token 阶段实际耗时 | 帧间隔 |
+|---|---|---|
+| PATCH 在循环里 await（改动前） | **7.09s**（流被拉长 2.4 倍） | 不规则 |
+| 后台协程刷新（改动后） | **3.09s**（≈纯喂流时间） | 稳定 0.65s |
+
+顺带两个细节：内容指纹没变就跳过这一帧（正在等工具返回时文字是静止的，别白烧飞书的更新额度）；
+收尾要先 `stop()` 等后台协程真的退干净、再 `flush()`，**不能 cancel** —— 取消只是让
+`to_thread` 外抛异常，那个已经在跑的 PATCH 线程并不会停，可能晚于最终内容落地、把回答盖回旧快照。
+
+`PATCH_INTERVAL` 取 0.4s 而不是更保守的值，是因为流式 PATCH 走 `quiet=True`：真被飞书限流也只是
+丢一帧，下一帧自愈，不影响回答。
 
 卡片用**卡片 JSON 2.0**结构，正文是 `markdown` 组件，支持标题、表格、代码块、引用、分割线，
 所以 LLM 的回答**原样贴进去**就能正常渲染。工具轨迹放进 `collapsible_panel`，默认收起。
@@ -202,6 +225,10 @@ mock 工具）的 `coroutine is None`，会被自动跳过，不受影响。超�
 LangGraph 的 `ToolNode` 会把错误文本当作**工具结果**回给 LLM，让它换工具或换参数重试，
 而不是让整轮对话一直挂着。
 
+同一个包装点还挂了结果瘦身：`resource list` 的返回会先投影成运维视图再交给模型（见下文
+「对话记忆治理」里的**当轮结果瘦身**小节）。分工是——入参兜底管"查得到"，超时管"不挂死"，
+瘦身管"别太胖"。
+
 效果（同一句提问"查看集群有哪些节点和正在运行的 pods"）：
 
 | | 加固前 | 加固后 |
@@ -211,19 +238,20 @@ LangGraph 的 `ToolNode` 会把错误文本当作**工具结果**回给 LLM，�
 | 实际入参 | `namespace: "all"` | `namespace: ""` |
 | 结论 | pods 为空（错） | 3 节点 / 23 个 pods（对） |
 
-## 对话记忆治理（轮数窗口 + 旧工具结果清理）
+## 对话记忆治理（轮数窗口 + 旧工具结果清理 + 当轮结果瘦身）
 
 checkpointer 会把每轮 **ToolMessage 的原文**一起存档。`resource list` 拉一次全量 pods 就是
 143KB YAML，从第二轮起每次模型调用都要把这段旧 YAML 重新预填一遍：同一句小问题实测
 **空历史 12.9s、带历史 37.1s**（群里那轮更慢到 105.8s，因为它工具调用更多、回答更长，
 而一轮里有几次工具调用就要做几次模型 pass，每 pass 都重读一遍历史）。
 
-`agent.py` 的 `MemoryWindowMiddleware` 两道闸门：
+三道闸门（前两道在 `agent.py` 的 `MemoryWindowMiddleware`，第三道在工具包装层）：
 
-| 钩子 | 作用 | 是否写存档 |
+| 闸门 | 作用 | 是否写存档 |
 |---|---|---|
 | `before_model` | 轮数窗口：历史超过 `MEMORY_WINDOW_ROUNDS` 轮（默认 10）时，用 `RemoveMessage` 整轮删除最老的轮次 | 是（历史不再无限增长） |
 | `wrap_model_call` | 体积清理：把「已结束旧轮」的 ToolMessage 原文换成占位符，当前轮原样保留 | 否（只影响本次调用） |
+| `_trim_list_result` | 当轮瘦身：`resource list` 的原始 YAML 投影成运维视图后才交给模型（详见下小节） | 是（进存档的就已经是精简版） |
 
 两个设计细节：
 
@@ -231,6 +259,41 @@ checkpointer 会把每轮 **ToolMessage 的原文**一起存档。`resource list
   ToolMessage，模型不会看到「有工具结果却没有工具调用」的残缺历史。
 - 被清理的只是「原始证据」，上一轮的**结论**仍留在该轮最终回答（AIMessage）里，模型照常
   可以引用；真需要细节时占位符会提醒它重新调工具，而不是凭记忆猜。
+
+### 第三道闸门：当轮结果瘦身（`TRIM_TOOL_PAYLOAD`）
+
+上面两道闸门管的都是**旧轮**，而「当前轮」的工具结果必须留着——模型正要根据它作答，
+清了就没法答题了。所以当前轮只能从**源头**减重：`resource list` 返回的原始 YAML 在交给
+模型之前，先投影成运维视图（`agent.py` 的 `_trim_list_result`，挂在工具包装层里）。
+
+投影保留了什么、丢了什么：
+
+| 保留（答题要用） | 丢弃（运维问答用不上） |
+|---|---|
+| `name` / `namespace` / `labels` / `nodeName` / `phase` / `podIP` / `hostIP` | `spec.volumes` + `projected`（14.8KB）、`spec.tolerations`（4.9KB） |
+| `containers[].image` 与 `resources.requests/limits` | `volumeMounts`（2.5KB）、`imageID`、`containerID`（各 70 字符 sha） |
+| `containerStatuses` 的 `ready` / `restartCount` / `state` / `lastState`（含 `reason`、`exitCode`） | `metadata.annotations`、探针、环境变量、`serviceAccount` 等 |
+| `abnormalConditions`：**只列非 `True` 的条件**（空列表即一切正常） | Node 的 `status.images` 清单压成 `imageCount` 一个数（12.9KB → 1 个数） |
+
+真机效果（同一对提问，各自全新会话）：
+
+| | 不瘦身 | 瘦身 | 变化 |
+|---|---|---|---|
+| turn1「集群有哪些节点和运行中 pods」 | 35.6s | **23.8s** | 快 11.8s（33%） |
+| turn2「default 空间 pod 详细信息」 | 26.2s | **19.0s** | 快 7.3s |
+| 列 Pod 的工具结果 | 135.2KB | **15.9KB** | 省 88% |
+| 列 Node 的工具结果 | 20.3KB | **4.4KB** | 省 78% |
+
+两点取舍要记下来：
+
+- **回答会变短**（turn1 从 5734 字降到 2039 字）。原始 YAML 里那些探针、挂载、环境变量本来
+  也答不出结论，模型很多时候是在把它们摊成篇幅。事实性内容（3 个节点、Ready 状态、IP、
+  重启次数）两边都正确。
+- **精简说明必须跟着结果一起给模型**（`_TRIM_NOTE`）：明确讲清「探针/挂载等字段已被裁掉、
+  `abnormalConditions` 空表示正常、要完整定义请用 `resource describe`」。少了这句话，模型会把
+  "看不到"当成"集群里没有"，然后开始编——这个坑在 namespace 那轮已经踩过一次。
+- 只裁 `resource list`。`resource describe` / `resource get` 的语义就是「我要这个对象的完整
+  定义」，裁掉等于把用户查的东西裁掉。想对照可把 `TRIM_TOOL_PAYLOAD=false` 退回原始 YAML。
 
 ## 与需求文档的差异（实现时的依据）
 
@@ -300,3 +363,30 @@ checkpointer 会把每轮 **ToolMessage 的原文**一起存档。`resource list
   本来是对症的工具，但它的 `keep` 语义是「保留最近 N 条工具结果」：第二轮时第一轮那份
   143KB 恰好是「最近的一条」，于是原封不动留下，等于没清。所以最终自己写了轮次感知的
   `MemoryWindowMiddleware`：旧轮全清、当前轮保留，正好绕开这个语义错位。
+- **`resource list` 的体积不是被某一个"垃圾字段"吃掉的**：直觉上以为 `managedFields`、
+  `annotations` 是大头，逐字段量化后（135.2KB 的列 Pod 结果）发现 `managedFields` 服务端早
+  就剥掉了、`annotations` 只占 4.5KB，体积其实平摊在 `spec`(31KB)/`status`(31KB)/`metadata`(16KB)。
+  所以"上黑名单删几个键"这种改法几乎不省。真正能删的是运维问答用不上的字段：
+  `volumes`+`projected`(14.8KB)、`tolerations`(4.9KB)、`volumeMounts`(2.5KB)、`imageID`(2.4KB)，
+  Node 侧则集中在一项——`status.images` 独占 12.9KB（Node 总共才 20.3KB）。
+  **结论：改投影之前先把字段体积排个序，别照抄"K8s YAML 噪音字段"的经验清单。**
+- **流式输出卡顿是渲染层的锅，但主犯不是"节流间隔"而是"在流里 await 网络"**：卡片 PATCH
+  写在 `async for event in bot.astream(...)` 内部，每次往返 0.2~0.5s 就把 token 循环挂起这么久，
+  流被打成"冻结 → 蹦一块"。改法是把刷新搬进后台协程（`CardReply._patcher`），token 侧只做内存累加。
+  顺带一个反直觉的点：**单独把 `PATCH_INTERVAL` 从 1.2s 调小会更糟**——PATCH 次数 ≈ 流式时长 ÷ 间隔，
+  调小等于把"挂起等网络"的总时长同比例放大。必须先把 await 挪出循环，再谈间隔。
+- **"某个函数第一次调用特别慢"先怀疑冷导入，别急着改代码**：测刷新节奏时发现第一次
+  `_patch_card` 花了 **8.17s**，而后续只要 0.25s。逐层计时后确认 8s 全在 `import lark_oapi`
+  本身（它的 `__init__` 会拉整棵 API 树），里面的 model 子模块导入接近 0。真实机器人启动时
+  WS 线程早就 import 过了，所以这笔开销线上根本不存在——是**测试没复现启动路径**造成的假象。
+  另外这里不能"顺手把导入提到模块顶部"：见上文「`lark_oapi` 在导入时就抓走了事件循环」，
+  提上去会让主线程抢到 `agent_loop`，WS 线程随后就报 `event loop is already running`。
+- **包装层里"读工具返回值"要先搞清 `response_format`，否则会静默失效**：结果瘦身写完在真机
+  一测，耗时完全没变、`[TRIM]` 日志一条都没打——`_result_text()` 每次都取到空串、每次都提前
+  原样返回。根因是这套 MCP 工具是 `response_format="content_and_artifact"`，**我们的包装层
+  拿到的是 `(内容块列表, artifact)` 二元组**，而 `ainvoke` 返回给外面的是已经转换好的内容块列表；
+  只按"字符串或块列表"判断的取文本逻辑，正好在包装层这一侧永远不成立。
+  定位手法值得记：分别 `await t.coroutine(...)` 与 `await t.ainvoke(...)`，把两者的
+  `type` / 长度 / 键名打印出来对比——形状差异一眼就暴露了。
+  教训：**改了返回值处理就必须验证"它真的跑了"**（打一条日志或断点），不能只看端到端耗时没变
+  就当"效果不明显"；否则会把 bug 当成结论。
