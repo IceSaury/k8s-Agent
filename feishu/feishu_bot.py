@@ -69,6 +69,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import statistics
 import threading
 import time
 from typing import Any
@@ -247,6 +248,13 @@ class CardReply:
         # 推送帧的成败计数，收尾时打进日志（用来验证会不会撞上飞书的频率限制）
         self.frames_ok = 0
         self.frames_failed = 0
+        # 每帧携带的字数增量 + 每帧推送时刻 + 模型最后一个 token 的时刻。
+        # 加这三样是为了回答"卡顿/成块"这类观感问题时报得出数字：
+        # 到底是帧太密每帧只带几个字，还是表格那段本来就是一次吐一大块。
+        self.frame_deltas: list[int] = []
+        self.frame_at: list[float] = []
+        self.last_token_at = 0.0
+        self._last_len = 0
 
     def on_tool_start(self, name: str, args: dict) -> None:
         self._pending_tools.setdefault(name, []).append(time.monotonic())
@@ -266,6 +274,11 @@ class CardReply:
         cost = f"  ({time.monotonic() - started.pop(0):.1f}s)" if started else ""
         mark = "✅" if ok else "❌"
         self.trace.append(f"{mark} {_tool_label(name)} 完成{cost}")
+
+    def on_token(self, text: str) -> None:
+        """模型吐字。只做内存累加，绝不在这条路径上 await 网络。"""
+        self.answer += text
+        self.last_token_at = time.monotonic()
 
     def _trace_text(self) -> list[str]:
         """截断过长的轨迹：留前 MAX_TRACE_LINES-1 行，其余折叠成一行汇总。"""
@@ -307,15 +320,20 @@ class CardReply:
 
     async def _push(self, final: bool) -> None:
         """推一帧。任何异常都只算丢一帧——不能让后台协程因此死掉。"""
+        text = self.render(final)
         try:
             ok = await asyncio.to_thread(
-                _stream_element, self.client, self.card_id, self.render(final), self._next_seq()
+                _stream_element, self.client, self.card_id, text, self._next_seq()
             )
         except Exception as exc:  # noqa: BLE001 - 推送失败不该中断本轮回答
             _log(f"[WARN] 流式推送异常：{type(exc).__name__}: {exc}")
             ok = False
         if ok:
             self.frames_ok += 1
+            # 只在成功时记账：丢帧会由下一帧一起补上，增量应当合并到那一帧头上
+            self.frame_deltas.append(len(text) - self._last_len)
+            self._last_len = len(text)
+            self.frame_at.append(time.monotonic())
         else:
             self.frames_failed += 1
 
@@ -364,6 +382,27 @@ class CardReply:
             await asyncio.to_thread(_close_streaming, self.client, self.card_id, self._next_seq())
         except Exception as exc:  # noqa: BLE001 - 关流式失败只是光标停不下来，别影响本轮回答
             _log(f"[WARN] 关闭流式异常：{type(exc).__name__}: {exc}")
+
+    def stats_line(self) -> str:
+        """
+        收尾用的流式体检：帧数、每帧增量的分布、帧间距、以及"模型说完到最后一帧落地"的尾巴。
+
+        为什么要这些数：观感上的"卡顿"和"表格一整块蹦出来"有两种可能——我们的帧太碎
+        （每帧只带几个字），或者模型本来就是一口气吐一大段表格。前者能改（合并帧），
+        后者改不了。没有 deltas 分布就只能猜。
+        """
+        if not self.frame_deltas:
+            return "流式推送 0 帧"
+        deltas = sorted(self.frame_deltas)
+        gaps = [b - a for a, b in zip(self.frame_at, self.frame_at[1:])]
+        tail = (self.frame_at[-1] - self.last_token_at) if self.last_token_at else 0.0
+        gap_txt = f"｜帧间距 中位 {statistics.median(gaps):.2f}s" if gaps else ""
+        return (
+            f"流式 {len(deltas)} 帧（{self.frames_failed} 帧失败）"
+            f"｜每帧增量 中位 {deltas[len(deltas) // 2]} 字 / 最大 {deltas[-1]} 字"
+            f"{gap_txt}"
+            f"｜末帧滞后模型 {tail:.1f}s"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +594,7 @@ async def process_message(bot: K8sAgent, client: Any, data: Any) -> None:
             elif event.kind == "tool_end":
                 reply.on_tool_end(event.tool_name, event.ok)
             elif event.kind == "token":
-                reply.answer += event.text
+                reply.on_token(event.text)
     except Exception as exc:  # noqa: BLE001 - 单条消息失败不能让机器人退出
         _log(f"[ERROR] 处理提问失败：{type(exc).__name__}: {exc}")
         reply.failed = True
@@ -568,8 +607,7 @@ async def process_message(bot: K8sAgent, client: Any, data: Any) -> None:
     await reply.finish()
     _log(
         f"已回复（{len(reply.trace)} 条工具记录，{len(reply.answer)} 字）"
-        f" | 流式推送 {reply.frames_ok} 帧成功"
-        + (f"，{reply.frames_failed} 帧失败" if reply.frames_failed else "，无丢帧")
+        f" | {reply.stats_line()}"
     )
 
 
