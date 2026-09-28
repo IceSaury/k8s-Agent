@@ -93,6 +93,15 @@ STREAM_ELEMENT_ID = "agent_answer"
 # 这个值只在"正在等工具返回、文本没变"时用来避免空转烧更新额度。
 IDLE_POLL_INTERVAL = 0.05
 
+# 进打字机的字数上限，超过就**停止喂帧**，剩下的正文留到收尾那一帧一次性出现。
+#
+# 为什么要有这个闸：客户端逐字速率约 **35 字/秒**且不可调（探针实测——一帧给 709 字，
+# 它仍然爬了约 20 秒），而模型出字约 70 字/秒，是它的两倍。也就是说喂得越多积压越多，
+# 卡片永远落在模型后面，最后关流式那一下再"啪"地补齐，观感就是"慢慢爬 + 突然跳完"。
+# 关掉打字机（整卡 PATCH）最快但会丢掉逐字效果，所以取中间值：让开头那句结论逐字出现，
+# 其余内容随收尾快照帧整块到位。200 字约等于"一句话总览 + 表格标题行"。
+TYPEWRITER_HEAD_CHARS = 200
+
 # 单条提问最多取多少字符，防止有人粘贴一整篇日志把上下文撑爆
 MAX_INPUT_CHARS = 1000
 
@@ -255,6 +264,8 @@ class CardReply:
         self.frame_at: list[float] = []
         self.last_token_at = 0.0
         self._last_len = 0
+        # 打字机闸门的触发点：停止喂帧时**实际已经推出去**的字数（0 = 没触发，全文都是逐字的）
+        self.head_pushed = 0
 
     def on_tool_start(self, name: str, args: dict) -> None:
         self._pending_tools.setdefault(name, []).append(time.monotonic())
@@ -344,9 +355,16 @@ class CardReply:
         所以帧间距就等于一次更新的网络往返（约 0.55s），是这条通道的物理上限；
         再往下压只能靠并发，而并发会让 sequence 到达顺序失控，不值当。
         只有内容确实没长出来时（多半在等工具返回）才短睡一下，避免空转烧更新额度。
+
+        超过 TYPEWRITER_HEAD_CHARS 就主动退出循环、不再喂帧：客户端逐字速率（约 35 字/秒）
+        只有模型出字速率的一半，继续喂只会把积压越攒越多，最后关流式时"啪"地跳完。
+        剩下的正文交给 finish() 那一帧一次性带上，观感就是"开头逐字 + 后文整块到位"。
         """
         seen: tuple[int, int, bool] | None = None
         while not self._stopping.is_set():
+            if len(self.answer) > TYPEWRITER_HEAD_CHARS:
+                self.head_pushed = self._last_len
+                return
             sig = self._snapshot_sig()
             if sig == seen:
                 with contextlib.suppress(asyncio.TimeoutError):
@@ -376,7 +394,13 @@ class CardReply:
         self._task = None
 
     async def finish(self) -> None:
-        """推最终文本，然后关掉流式模式（不关的话打字光标会一直转）。"""
+        """
+        推最终文本，然后关掉流式模式。
+
+        这一帧是**全文快照**：打字机闸门关掉之后，模型剩下的输出全靠它一次带出去。
+        紧接着的 settings 调用会把 streaming_mode 关掉，客户端于是停止逐字动画、
+        直接把没显示的部分补齐——这正是探针实测到"推完就关的那张卡看起来很快"的原因。
+        """
         await self._push(final=True)
         try:
             await asyncio.to_thread(_close_streaming, self.client, self.card_id, self._next_seq())
@@ -385,11 +409,10 @@ class CardReply:
 
     def stats_line(self) -> str:
         """
-        收尾用的流式体检：帧数、每帧增量的分布、帧间距、以及"模型说完到最后一帧落地"的尾巴。
+        收尾用的流式体检：帧数、每帧增量分布、帧间距、末帧滞后，以及打字机闸门有没有触发。
 
-        为什么要这些数：观感上的"卡顿"和"表格一整块蹦出来"有两种可能——我们的帧太碎
-        （每帧只带几个字），或者模型本来就是一口气吐一大段表格。前者能改（合并帧），
-        后者改不了。没有 deltas 分布就只能猜。
+        为什么要这些数：观感上的"卡顿"和"表格一整块蹦出来"有好几种可能——帧太碎、
+        客户端打字机比模型慢、或者关流式的时机不对。没有 deltas 分布就只能猜。
         """
         if not self.frame_deltas:
             return "流式推送 0 帧"
@@ -397,11 +420,15 @@ class CardReply:
         gaps = [b - a for a, b in zip(self.frame_at, self.frame_at[1:])]
         tail = (self.frame_at[-1] - self.last_token_at) if self.last_token_at else 0.0
         gap_txt = f"｜帧间距 中位 {statistics.median(gaps):.2f}s" if gaps else ""
+        head = (
+            f"｜逐字只喂了 {self.head_pushed} 字，其余 {deltas[-1]} 字随快照帧补齐"
+            if self.head_pushed else "｜全文逐字（未触发打字机闸门）"
+        )
         return (
             f"流式 {len(deltas)} 帧（{self.frames_failed} 帧失败）"
             f"｜每帧增量 中位 {deltas[len(deltas) // 2]} 字 / 最大 {deltas[-1]} 字"
             f"{gap_txt}"
-            f"｜末帧滞后模型 {tail:.1f}s"
+            f"｜末帧滞后模型 {tail:.1f}s{head}"
         )
 
 
