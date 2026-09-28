@@ -142,7 +142,7 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
 ```
 用户发问
   └─ cardkit.v1.card.create        建卡片实体，拿 card_id
-       └─ im.v1.message.reply      用 card_id 回复一张「正在分析…」卡片
+       └─ im.v1.message.reply      用 card_id 回复一张空正文卡片
             └─ 后台协程循环 cardkit.v1.card_element.content(card_id, element_id, 全量文本, sequence++)
                  └─ 收尾推最终文本 -> cardkit.v1.card.settings 关 streaming_mode
 ```
@@ -160,7 +160,8 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
 所以整张卡只能有一个正文元素——工具轨迹不再用折叠面板，改成 markdown 列表项拼进同一段文本
 （列表项是为了绕开另一个坑：单个 markdown 组件里裸 `\n` 属于软换行，渲染时可能被忽略）。
 状态行也写进正文末尾（`> ✅ 完成 ｜ 2 步工具调用 ｜ 耗时 42.3s`），因为副标题属于卡片头，
-改它得走整卡更新，不值当。
+改它得走整卡更新。**卡片头因此不放任何状态文案**——建实体时写死的"正在分析…"没有机会被
+改掉，答完就会一直挂着谎报状态的副标题；进度只由正文承载（首帧是占位提示，末帧带状态行）。
 
 **推送为什么必须放在后台协程里，而不是写在 token 循环里。** 早先的写法是每来一个 token 就
 `await maybe_flush()`，看起来只是"节流"，实际上一次更新是真实的 HTTPS 往返（整卡 PATCH 约

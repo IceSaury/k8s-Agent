@@ -180,6 +180,7 @@ def build_card(
       - 能流式的组件只有 plain_text / markdown，且该组件必须自带自定义 element_id
     于是整张卡只剩一个正文元素，工具轨迹也得拼进这段文本，原先的可折叠面板取消。
     两条快速回复（非文字输入提示、/clear 确认）不参与流式，用 streaming=False。
+    subtitle 只能用在 streaming=False 的卡上：卡片头走不到流式通道，写进去就是终态。
     """
     answer: dict = {"tag": "markdown", "content": body or "🔍 正在分析，请稍候…"}
     if streaming:
@@ -532,10 +533,11 @@ async def process_message(bot: K8sAgent, client: Any, data: Any) -> None:
         )
         return
 
-    # 流式卡片的两步前置：先建卡片实体拿 card_id，再用 card_id 回复消息
-    card_id = await asyncio.to_thread(
-        _create_card, client, build_card("", subtitle="正在分析…")
-    )
+    # 流式卡片的两步前置：先建卡片实体拿 card_id，再用 card_id 回复消息。
+    # 这里**不给卡片头加"正在分析…"副标题**：改副标题要走整卡更新，而流式方案不做整卡更新，
+    # 写死它就会答完之后头部一直挂着"正在分析…"。状态统一由正文承载（开头是占位提示，
+    # 结尾是 render(final=True) 生成的状态行）。
+    card_id = await asyncio.to_thread(_create_card, client, build_card(""))
     if card_id is None:
         return
     if await asyncio.to_thread(_reply_card_entity, client, message.message_id, card_id) is None:
