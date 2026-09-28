@@ -49,9 +49,9 @@ lark-oapi 提供的 WebSocket 长连接模式由客户端主动连飞书，不�
 `99991672`；另外能承载流式文本的组件只有 `plain_text` / `markdown`，且该组件必须自带
 `element_id`，所以整张卡只剩一个正文元素——工具轨迹也拼进这段文本，原先的折叠面板取消了。
 
-推送由 `CardReply` 的**后台协程**按 `STREAM_INTERVAL` 的节奏做，不在消费 token 的循环里
-await。原因见 `CardReply` 的文档字符串：一次更新是实打实的 HTTPS 往返（实测约 0.6s），
-写在 token 循环里会把流打断成"冻结 -> 蹦一大块"，这正是之前流式输出卡顿的来源。
+推送由 `CardReply` 的**后台协程**连着推（不设帧率闸，间隔等于一次网络往返），不在消费
+token 的循环里 await。原因见 `CardReply` 的文档字符串：一次更新是实打实的 HTTPS 往返
+（实测约 0.5s），写在 token 循环里会把流打断成"冻结 -> 蹦一大块"，这正是之前流式输出卡顿的来源。
 
 卡片用 **卡片 JSON 2.0** 结构（见 build_card）：2.0 的 markdown 组件支持全部标准
 Markdown，LLM 的回答可以原样贴进去。注意 2.0 的卡片必须是共享卡片
@@ -87,10 +87,10 @@ MAX_TRACE_LINES = 12
 # 流式更新接口就是按 /cards/{card_id}/elements/{element_id}/content 定位的
 STREAM_ELEMENT_ID = "agent_answer"
 
-# 后台推送流式帧的时间闸（秒）。实测单次更新往返约 0.6s，所以真正的帧率是
-# 1/(闸+往返)≈1 次/秒，仍远低于官方的 10 次/秒限制；调小这个值收益有限，
-# 因为它会被往返时间吃掉。
-STREAM_INTERVAL = 0.3
+# 卡片没有新内容时的轮询间隔（秒）。**不是帧率闸**：有新增就立刻连着推，
+# 帧率因此只由网络往返决定（实测约 0.55s/次 ≈ 1.8 帧/秒，离官方 10 次/秒很远）。
+# 这个值只在"正在等工具返回、文本没变"时用来避免空转烧更新额度。
+IDLE_POLL_INTERVAL = 0.05
 
 # 单条提问最多取多少字符，防止有人粘贴一整篇日志把上下文撑爆
 MAX_INPUT_CHARS = 1000
@@ -216,8 +216,8 @@ class CardReply:
     """
     一条问答对应一张**流式卡片**的回复器。
 
-    一轮的生命周期：建卡片实体拿 card_id -> 用 card_id 回复消息 -> 后台协程按
-    STREAM_INTERVAL 往 card_id 的那个 markdown 元素推**全量文本**（sequence 严格递增）
+    一轮的生命周期：建卡片实体拿 card_id -> 用 card_id 回复消息 -> 后台协程不停地往
+    card_id 的那个 markdown 元素推**全量文本**（sequence 严格递增）
     -> 收尾推最终文本，再调设置接口关掉 streaming_mode。
 
     三个容易踩错的点：
@@ -320,20 +320,20 @@ class CardReply:
 
     async def _patcher(self) -> None:
         """
-        后台推送循环：每隔 STREAM_INTERVAL 看一眼最新快照，有变化就推一次全量文本。
+        后台推送循环：**推完一帧立刻回来看有没有新内容**，不设帧率闸。
 
-        它睡多久都不会拖慢模型输出的消费，所以帧间距是稳定的。
+        所以帧间距就等于一次更新的网络往返（约 0.55s），是这条通道的物理上限；
+        再往下压只能靠并发，而并发会让 sequence 到达顺序失控，不值当。
+        只有内容确实没长出来时（多半在等工具返回）才短睡一下，避免空转烧更新额度。
         """
         seen: tuple[int, int, bool] | None = None
         while not self._stopping.is_set():
-            with contextlib.suppress(asyncio.TimeoutError):
-                # 用"等停止事件"代替纯 sleep：收尾时能立刻醒来退出，不必白等满一帧
-                await asyncio.wait_for(self._stopping.wait(), timeout=STREAM_INTERVAL)
-            if self._stopping.is_set():
-                break
             sig = self._snapshot_sig()
             if sig == seen:
-                continue  # 内容没变（比如正在等工具返回），不白烧飞书的更新额度
+                with contextlib.suppress(asyncio.TimeoutError):
+                    # 用"等停止事件"代替纯 sleep：收尾时能立刻醒来退出，不必白等满一轮
+                    await asyncio.wait_for(self._stopping.wait(), timeout=IDLE_POLL_INTERVAL)
+                continue
             seen = sig
             await self._push(final=False)
 
