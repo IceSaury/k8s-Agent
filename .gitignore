@@ -23,3 +23,6 @@ venv/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 本地个人文档，不入库
+/项目总结-简历描述.md
