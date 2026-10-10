@@ -1,0 +1,6 @@
+# Dev-only tools used by CI. The Agent runs fine without anything in this file.
+# NOTE: keep this file ASCII-only. pip on Chinese Windows reads it with the system
+#       locale (cp936/GBK), so non-ASCII comments raise UnicodeDecodeError
+#       (same constraint as requirements.txt; details live in README.md).
+
+ruff==0.16.10

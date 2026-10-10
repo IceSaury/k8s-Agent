@@ -114,8 +114,8 @@ def resource_list(kind: str, namespace: str) -> str:
     """list resources in a namespace - 列出某类资源（mock）。"""
     kind_l = kind.lower()
     if kind_l in ("node", "nodes"):
-        rows = [f"NAME     STATUS   ROLES            AGE    VERSION\n"
-                f"master   Ready    control-plane    30d    v1.35.2"]
+        rows = ["NAME     STATUS   ROLES            AGE    VERSION\n"
+                "master   Ready    control-plane    30d    v1.35.2"]
     elif kind_l in ("pod", "pods"):
         rows = [f"{'NAME':<36}{'READY':<8}{'STATUS':<10}{'RESTARTS':<10}NODE"]
         rows += [f"{p['name']:<36}{p['ready']:<8}{p['phase']:<10}{p['restarts']:<10}{p['node']}"
