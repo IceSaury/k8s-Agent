@@ -1,5 +1,7 @@
 # K8s 运维助手 Agent
 
+![CI](https://github.com/IceSaury/k8s-Agent/actions/workflows/ci.yml/badge.svg)
+
 面向 SRE 日常运维的 AI Agent：用自然语言问集群状态，模型自己决定调哪个工具、调几次，最后给出结论。
 K8s 侧的能力不是我自己写的，而是通过 **MCP 协议**接一个现成的 K8s MCP Server（19 个工具），官方文档
 与排障资料由互联网搜索工具补。交付两个入口：终端 CLI 与飞书机器人。
